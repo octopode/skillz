@@ -1,0 +1,34 @@
+# Probe for snakemake-executor-plugin-slurm array mode (see SKILL.md "## Job arrays").
+# Run from a scratch dir with: snakemake --executor slurm -j <J> --slurm-array-jobs unit \
+#   --slurm-keep-successful-logs --retries 1 --config nunits=12 [failone=1] [stagger=10]
+# Config keys need >= 2 characters in snakemake 9 (`n=12` is rejected).
+# failone=1 makes unit 3 fail once (flag file in the PARENT dir, so use a fresh parent).
+N = int(config.get("nunits", 12))
+STAG = int(config.get("stagger", 0))
+FAILONE = int(config.get("failone", 0))
+
+localrules: all, prep
+
+rule all:
+    input: expand("out/u{i}.txt", i=range(1, N + 1))
+
+rule prep:
+    output: "prep/p{i}.txt"
+    params: s=lambda wc: int(wc.i) * STAG
+    shell: "sleep {params.s}; echo {wildcards.i} > {output}"
+
+rule unit:
+    input: "prep/p{i}.txt"
+    output: "out/u{i}.txt"
+    threads: 2
+    resources:
+        mem_mb=lambda wc: 1000 + 100 * int(wc.i),
+        runtime=10,
+        slurm_partition="shared",
+    params: fail=lambda wc: 1 if (FAILONE and int(wc.i) == 3) else 0
+    shell:
+        """
+        if [ {params.fail} = 1 ] && [ ! -e ../fail3.flag ]; then touch ../fail3.flag; echo deliberate-fail; exit 1; fi
+        for k in $(seq {threads}); do timeout 20 sh -c 'while :; do :; done' & done; wait
+        echo "i={wildcards.i} A=${{SLURM_ARRAY_JOB_ID:-}} a=${{SLURM_ARRAY_TASK_ID:-}} J=${{SLURM_JOB_ID:-}} cpus=${{SLURM_CPUS_PER_TASK:-}} mem=${{SLURM_MEM_PER_NODE:-}}" > {output}
+        """

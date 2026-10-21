@@ -1,6 +1,6 @@
 ---
 name: cannon-allocation-efficiency
-description: "Verify that cluster jobs can actually saturate the CPU cores and memory they reserve — before submitting and after running. Use when dispatching Snakemake or SLURM work to a shared HPC cluster, when a rule reserves multiple cores or tens of GB, when a stage runs far slower than its compute would suggest, or when auditing fairshare/core-hour usage. Covers: passing {threads} through to the command, worker pools that cannot fill their slices, libraries that grab every visible core inside an already-parallel loop, batch granularity against heavy-tailed per-unit cost, and reserved-vs-used auditing from sacct and snakemake benchmark records."
+description: "Verify that cluster jobs can actually saturate the CPU cores and memory they reserve — before submitting and after running. Use when dispatching Snakemake or SLURM work to a shared HPC cluster, when a rule reserves multiple cores or tens of GB, when a stage runs far slower than its compute would suggest, or when auditing fairshare/core-hour usage. Covers: passing {threads} through to the command, worker pools that cannot fill their slices, libraries that grab every visible core inside an already-parallel loop, batch granularity against heavy-tailed per-unit cost, reserved-vs-used auditing from sacct and snakemake benchmark records, and SLURM job arrays (`sbatch --array`, `%N` throttles, MaxArraySize/MaxSubmitJobs limits, per-task (jobid_taskid) sacct accounting, and why Snakemake's `--slurm-array-jobs` is unsafe in executor plugin 2.8.0)."
 metadata:
   authored_via: "claude-science"
   published_by: "agent"
@@ -161,6 +161,8 @@ out = subprocess.run(["sacct", "-u", user, "-S", since, "-P", "-n", "--format",
 
 `MaxRSS` appears only on the `.batch`/`.extern` sub-steps, so fold those into
 their parent `JobID` before reading peak memory — a naive parse reports 0.
+`audit_sacct(text)` does the folding (and handles array tasks); pass it `sacct -P`
+output *with* the header line.
 
 Rank jobs by `reserved - used` rather than by efficiency percentage. A 2-core
 job at 3% efficiency wastes less than a 48-core job at 60%, and only the
@@ -201,9 +203,10 @@ allocation is 1.
 sacct -j <ids> -P --format=JobID,AllocCPUS,TotalCPU,Elapsed,State
 ```
 
-Two traps in reading it. `TotalCPU` is **zero at the allocation level** — it lives on the
-`.batch` / `.0` sub-steps, so aggregate per job id and take the max across steps, exactly
-as with `MaxRSS`. And `TotalCPU` is **not populated while a job runs**; for a live job use
+Two traps in reading it. `TotalCPU` is **zero on the allocation row under `sacct -X`** —
+it lives on the `.batch` / `.0` sub-steps (in a full listing, SLURM 26.05 also writes their
+sum on the allocation row), so aggregate per job id and take the larger of the allocation
+row and the step sum, as `parse_sacct` does, rather than reading one row. And `TotalCPU` is **not populated while a job runs**; for a live job use
 `sstat -j <jobid>.0 --format=AveCPU,NTasks,AveRSS` instead.
 
 ### Attributing a job to a rule when the job name is a UUID
@@ -216,7 +219,12 @@ in the log path the executor writes:
 .snakemake/slurm_logs/rule_<rulename>/<wildcards>/<jobid>.log
 ```
 
-Walk that tree to build `rule -> [jobid]`, then aggregate `sacct` per rule. Rank rules by
+Walk that tree to build `rule -> [jobid]`, then aggregate `sacct` per rule. Array tasks
+break the pattern: their logs are `.snakemake/slurm_logs/rule_<rulename>/<arrayid>_<task>.log`
+with no wildcard directory. Simpler on CANNON, where `AccountingStoreFlags` includes
+`job_comment`: the executor writes `rule_<rulename>[_wildcards_<w>]` into `--comment`, so
+`sacct --format=...,Comment` carries the rule, and `audit_sacct(text, by="rule")` groups on
+it. For an array the wildcards in the comment are the *first task's* only. Rank rules by
 `reserved - used` rather than by utilisation: a rule at 45% over 600 wall-hours wastes far
 more than one at 17% over 7.
 
@@ -243,6 +251,134 @@ redoing the work already done. Six jobs 3.5 hours into a 7-hour stage at 8 cores
 waste ~105 core-hours if left alone and ~250 if killed and restarted at 4, because the 3.5
 hours already spent are discarded. Apply the fix to the next submission and let the current
 one run. Good cluster citizenship is about total waste, not about killing things quickly.
+
+## Job arrays
+
+**An array saves scheduler work, not core-hours.** `sbatch --array` puts N tasks under
+one pending record, but once a task starts it is its own allocation, reserved and
+charged exactly like a separate job, and each task still pays its own start-up. Use an
+array for many independent units of the same resource shape, launched from your own
+sbatch script. Every task gets the *same* request, so size it to the largest unit and
+read the spread afterwards: a heavy tail of unit cost or memory is paid by every task.
+
+### CANNON limits (measured 2026-10-21, SLURM 26.05.4)
+
+| limit | value | consequence |
+|---|---|---|
+| `MaxArraySize` | 10000 | caps the task **index**: `--array=0-9999` is accepted, `--array=1-10000` is rejected ("Invalid job array specification") |
+| user association `MaxSubmitJobs` | 10100 | **every task counts**: one 10000-task array is nearly the whole budget |
+| `test` QOS | 5 submitted / 5 running | a 5-task array is accepted, a 6-task array fails with `QOSMaxSubmitJobPerUserLimit` |
+| `MaxJobCount` | 300000 | cluster-wide |
+
+```python
+array_chunks(25000)                    # [{'offset':0,'n':10000,'spec':'0-9999'}, ... offset 20000, '0-4999']
+array_chunks(12, throttle=4, max_submit=5)
+# in the job script:  UNIT=$((OFFSET + SLURM_ARRAY_TASK_ID))
+```
+
+If `n_units > max_submit`, the chunks cannot all be queued at once. Submit the next one only
+after the previous one drains; a `--dependency` does not help, because a pending dependent
+still counts as submitted.
+
+### Throttle with `%N`, adjust it live
+
+`--array=1-600%50` holds at most 50 tasks running. `scontrol update JobId=<arrayid>
+ArrayTaskThrottle=<N>` changes the cap on a live array (verified: `%2` held 2 running,
+raising it to 3 started a third). As with any concurrency cap, a throttle costs wall
+time, never core-hours. Use one when the tasks hammer shared storage. Lustre small-file
+load is an aggregate problem, and a throttle is how one user stays out of it.
+
+### Reading array accounting
+
+* Task rows are `<arrayid>_<task>`, steps `<arrayid>_<task>.batch` / `.extern` / `.0`; a
+  not-yet-started remainder is one row `<arrayid>_[3-6%2]` in both `squeue` and `sacct`.
+* **`JobIDRaw` is a different number for every task**, and the *last-dispatched* task
+  inherits the array's own id as its raw id (task 6 of 54337667 had raw id 54337667; task
+  1 had 54337718). `SLURM_JOB_ID` inside a task is that raw id; `SLURM_ARRAY_JOB_ID`
+  and `SLURM_ARRAY_TASK_ID` identify the task. Key every join on `JobID`, never on
+  `JobIDRaw`.
+* `sacct -j <arrayid>` returns every task; `sacct -j <arrayid>_<task>` one task.
+* Same folding as for plain jobs: `MaxRSS` and (under `-X`) `TotalCPU` live on steps.
+
+```python
+txt = subprocess.run(["sacct", "-j", ids, "-P", "--format",
+                      "JobID,JobIDRaw,JobName,Partition,AllocCPUS,ReqMem,Elapsed,"
+                      "TotalCPU,MaxRSS,State,ExitCode,Comment"],
+                     capture_output=True, text=True).stdout
+audit_sacct(txt)               # one row per task: util, waste_core_h, serial_signature
+audit_sacct(txt, by="array")   # per array: tail_ratio, mem_headroom, failed, serial_units
+```
+
+Read `by="array"` for what one shared request costs. `tail_ratio` is max/median elapsed;
+well above 1 means the slow units set the walltime every task reserved. `mem_headroom`
+is request / peak RSS across tasks. `serial_units` counts tasks at roughly 1/AllocCPUS
+utilisation, which is the Job Defense Shield pattern, task by task.
+
+### Snakemake `--slurm-array-jobs`: do not enable it with executor plugin 2.8.0
+
+The plugin can submit a rule's ready jobs as one array (`--slurm-array-jobs=rule1,rule2`
+or `all`; `--slurm-array-limit`, default 1000, capped at `MaxArraySize - 1`). Tested on
+CANNON 2026-10-21 with the versions in the project envs (snakemake 9.25.1,
+snakemake-executor-plugin-slurm 2.8.0, -jobstep 0.6.1), on a toy rule of 12 two-core
+jobs, it was not safe. Each of the following was reproduced:
+
+1. **Every task re-targets the first task's job.** Each task is submitted with the
+   chunk's first job as its base command, and runs its own job nested inside that. The
+   outer Snakemake process therefore *deletes the first job's output on start-up*
+   (`Job.prepare()` removes existing outputs) and *requires it at exit*. A task that
+   starts after task 1 has finished wipes task 1's output. A task that checks before
+   task 1 has written fails with `MissingOutputException`, even though its own job
+   succeeded. Some chunks passed by luck of timing. In one run, two tasks started a
+   minute after the others, once task 1 had finished; 7 of the chunk's other 9 tasks
+   then failed on task 1's missing output. In another run, 5 of 6 tasks of a chunk
+   failed. This is upstream
+   issue #488. PR #489 (opened 2026-10-01) proposes the fix; the 2.8.0 release
+   (2026-08-10) predates both.
+2. **Under the default `sacct` status query, every task reports one task's state.** The
+   plugin queries `sacct -X --format=JobIdRaw,State`. Task ids `<A>_<t>` never appear in
+   that output, so the lookup falls back to `<A>`, the raw id of the last-dispatched task. One
+   task that failed in 2 s got 10 running siblings marked FAILED, and `--retries 1`
+   resubmitted all 11 while the originals were still running: 22 executions for 11
+   units, with duplicate jobs writing the same outputs. If the base task finishes
+   *first*, a still-running sibling is declared done instead. `--slurm-status-command squeue` reports `<A>_<t>` correctly
+   (`MinJobAge` is 600 s on CANNON, enough for squeue to still see finished tasks), and
+   fixes this item only.
+3. **`--jobs` below half the ready jobs deadlocks.** The scheduler marks the selected jobs
+   as running before handing them over. The plugin then holds them back ("Array job
+   collection incomplete … waiting for more jobs") whenever they number fewer than the
+   rule's still-ready jobs and fewer than the chunk size. They are never submitted, and
+   never offered again. Verified: 12 ready with `-j 4`, no sbatch call ever made, and
+   SIGTERM only produced "Will exit after finishing currently running jobs", so the driver
+   sat until its walltime ran out. With `-j 6` the same 12 went out as two arrays of 6.
+   `array_mode_stalls(ready, jobs)` encodes the condition.
+4. **All tasks get the first job's resources**, plus a ≥1 MB payload fudge on `--mem`.
+   A unit declaring `mem_mb=2100` ran with 2001. Callable or `attempt`-scaled resources
+   are silently under- or over-reserved. `check_allocations(path, array_rules=[...])`
+   flags them, along with `group:` rules, which are never arrayed.
+5. **Task 1 runs without the srun step.** The executor's efficiency report (built from
+   `.N` step rows) omits the first task of every array, and in that task's shell
+   `SLURM_CPUS_PER_TASK` and `SLURM_MEM_PER_NODE` are unset. Any `-t
+   ${SLURM_CPUS_PER_TASK}` idiom breaks there; pass `{threads}`. Its CPU time is still on
+   `.batch`, which `audit_sacct` counts.
+6. **Arrays form only from jobs that become ready in the same scheduling pass.** When
+   upstream jobs finished one at a time, all six units went out as regular jobs. The
+   documented "synchronization overhead" did not appear, but neither did any saving.
+
+Leave array mode off. If scheduler load is the concern, cap `--jobs` and re-granulate the
+rule so that one job processes a batch of units (see "After it finishes"), then verify
+the batch actually fills its cores with `audit_sacct(by="rule")`. Before relying on
+`group-components` for that, check utilisation: upstream issue #495 reports grouped
+components on 2.8.0 running one at a time inside an allocation sized for all of them in
+parallel. That has not been checked on CANNON.
+
+**Re-test before enabling on a newer plugin.** `array_probe/Snakefile` in this skill is the
+toy workflow used above. Three runs cover the failures: `--config failone=1` (status
+isolation and retries), prebuilt `prep/` with `-j 4` (stall), and `-j 6` with a busy
+queue (first-task output race). A fixed plugin passes when every run
+finishes on its own, and the task count in `audit_sacct(txt, by="unit")` equals the
+number of units, plus the single retry of unit 3 under `failone=1`, with no other FAILED
+task. `check_allocations("array_probe/Snakefile", array_rules=["unit"])` flags the
+probe's per-unit `mem_mb` on purpose (item 4).
 
 ## Stage expensive runs behind a cheap, visible gate
 

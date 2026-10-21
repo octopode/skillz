@@ -7,7 +7,7 @@ self-contained skill: a `SKILL.md` with YAML frontmatter (`name`,
 | Skill | What it covers |
 |---|---|
 | [`snakemake-workflow`](snakemake-workflow/) | Building, extending and reviewing Snakemake workflows to upstream best practice: the official layout, the `--lint` / `snakefmt` / `--report` / `--containerize` / `--generate-unit-tests` toolchain, DAG and wildcard semantics that cause real bugs, and threads/resources for local and cluster execution. References are in `references/`. |
-| [`cannon-allocation-efficiency`](cannon-allocation-efficiency/) | Checking that cluster jobs can actually saturate the CPU cores and memory they reserve, both before submitting and after running: `{threads}` pass-through, worker pools, nested-parallelism oversubscription, batch granularity, and reserved-vs-used audits from `sacct` and Snakemake benchmark records. Written against Harvard FASRC's Cannon cluster, but applies to any SLURM site. |
+| [`cannon-allocation-efficiency`](cannon-allocation-efficiency/) | Checking that cluster jobs can actually saturate the CPU cores and memory they reserve, both before submitting and after running: `{threads}` pass-through, worker pools, nested-parallelism oversubscription, batch granularity, reserved-vs-used audits from `sacct` and Snakemake benchmark records, and SLURM job arrays (limits, `%N` throttles, per-task accounting, and why Snakemake's `--slurm-array-jobs` is unsafe in executor plugin 2.8.0; `array_probe/` holds the test workflow). Written against Harvard FASRC's Cannon cluster, but applies to any SLURM site. |
 
 `snakemake-workflow` hands cluster-sizing questions off to
 `cannon-allocation-efficiency`, so install both together.
