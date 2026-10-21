@@ -12,6 +12,15 @@ self-contained skill: a `SKILL.md` with YAML frontmatter (`name`,
 `snakemake-workflow` hands cluster-sizing questions off to
 `cannon-allocation-efficiency`, so install both together.
 
+## Cluster notes
+
+[`cluster-notes/cannon.md`](cluster-notes/cannon.md) is a working field guide to Harvard FASRC's
+Cannon cluster: partitions, maintenance reservations, scheduler and storage quirks, and
+job-array limits, as found in day-to-day use. It is mirrored automatically, with personal
+identifiers replaced, every time the maintainer's notes change, so do not edit it here. Open an
+issue with corrections. Some passages refer to the maintainer's own projects and agent harness;
+the cluster facts stand on their own.
+
 ## Installing
 
 Copy or upload a skill folder into your agent's skills location. For

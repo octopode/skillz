@@ -400,3 +400,121 @@ def array_mode_stalls(ready, jobs, array_limit=1000, max_array_size=10000):
     if selected == 1:
         return remaining >= 2
     return selected < remaining and selected < chunk
+
+
+# ---------------------------------------------------------------------------
+# Public mirror of the cluster notes. See SKILL.md '## Publishing the cluster notes'.
+# ---------------------------------------------------------------------------
+
+NOTES_RULE_BEGIN = "<!-- SYNC-RULE:BEGIN"
+NOTES_RULE_END = "SYNC-RULE:END -->"
+NOTES_SENSITIVE_SECTION = (r"~/\.ssh/|IdentityFile|deploy[ -]key|authorized_keys|"
+                           r"BEGIN [A-Z ]*PRIVATE KEY")
+NOTES_SECRET_PATTERNS = (r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}",
+                         r"-----BEGIN [A-Z ]*PRIVATE KEY-----", r"AKIA[0-9A-Z]{16}",
+                         r"xox[baprs]-[A-Za-z0-9-]{10,}", r"\bsk-[A-Za-z0-9]{20,}",
+                         r"(?i)\b(password|passwd|api[_-]?key|secret|token)\s*[:=]\s*['\"]?[A-Za-z0-9/+_\-]{12,}")
+
+
+def redact_cluster_notes(text):
+    """Return (public_text, report) for a cluster-notes document.
+
+    Identifiers are DERIVED FROM THE TEXT, never hard-coded, so this function is
+    safe to publish: usernames from /n/homeNN/<user> and /Users/<user>, lab names
+    from /n/<vol>/LABS/<lab> and /n/netscratch/<lab>. Home paths become $HOME,
+    bare usernames $USER, lab names <lab>. Removed entirely: the private rule
+    block between NOTES_RULE_BEGIN/END (which may also list extra redactions as
+    lines `redact: <term> -> <replacement>`), and every markdown section whose
+    heading or body matches NOTES_SENSITIVE_SECTION (SSH config, deploy keys).
+    Raises ValueError if a derived identifier survives or a secret-like
+    pattern is present, so the caller cannot publish a leak by accident.
+    """
+    report = {"users": [], "labs": [], "extra": [], "dropped_sections": []}
+    extra = []
+    b = text.find(NOTES_RULE_BEGIN)
+    if b != -1:
+        e = text.find(NOTES_RULE_END, b)
+        if e == -1:
+            raise ValueError("unterminated SYNC-RULE block")
+        block = text[b:e]
+        for m in re.finditer(r"(?m)^\s*redact:\s*(.+?)\s*->\s*(.*?)\s*$", block):
+            extra.append((m.group(1), m.group(2)))
+        text = text[:b].rstrip() + "\n" + text[e + len(NOTES_RULE_END):].lstrip("\n")
+    # drop sensitive sections (a section runs to the next heading of any level)
+    parts = re.split(r"(?m)^(?=#{1,6} )", text)
+    kept = []
+    for p in parts:
+        if re.search(NOTES_SENSITIVE_SECTION, p):
+            report["dropped_sections"].append(p.splitlines()[0].strip() if p.strip() else "(preamble)")
+            continue
+        kept.append(p)
+    text = "".join(kept)
+    users = sorted(set(re.findall(r"/n/home\d+/([A-Za-z0-9_.-]+)", text)) |
+                   set(re.findall(r"(?<![\w./-])/Users/([A-Za-z0-9_.-]+)", text)))
+    labs = sorted(set(re.findall(r"/n/[A-Za-z0-9_]+/LABS/([A-Za-z0-9_.-]+)", text)) |
+                  set(re.findall(r"/n/netscratch/([A-Za-z0-9_.-]+)", text)) - {"Everyone"})
+    for u in users:
+        text = re.sub(r"/n/home\d+/%s\b" % re.escape(u), "$HOME", text)
+        text = re.sub(r"(?<![\w./-])/Users/%s\b" % re.escape(u), "$HOME", text)
+        text = re.sub(r"(?<![\w$])%s\b" % re.escape(u), "$USER", text, flags=re.IGNORECASE)
+    for lab in labs:
+        text = re.sub(r"(?<![\w<])%s\b" % re.escape(lab), "<lab>", text, flags=re.IGNORECASE)
+    for term, repl in extra:
+        text = text.replace(term, repl)
+    report.update(users=users, labs=labs, extra=[t for t, _ in extra])
+    left = [x for x in users + labs + [t for t, _ in extra]
+            if x and re.search(re.escape(x), text, re.IGNORECASE)]
+    if left:
+        raise ValueError("identifiers survived redaction: %s" % left)
+    hits = [p for p in NOTES_SECRET_PATTERNS if re.search(p, text)]
+    if hits:
+        raise ValueError("secret-like pattern present, refusing: %s" % hits)
+    return text, report
+
+
+def publish_cluster_notes(notes_path, repo, dest_path, title, branch="main",
+                          dry_run=False, token_env="GITHUB_TOKEN"):
+    """Redact a cluster-notes file and commit it to a GitHub repo if it changed.
+
+    notes_path: the notes exactly as read (write the compute_details 'details'
+    string to a file; do not retype it). repo: 'owner/name'. dest_path: path in
+    the repo, e.g. 'cluster-notes/cannon.md'. Uses the GitHub contents API with
+    the token in $GITHUB_TOKEN; pushes only when the redacted body differs from
+    what is already there, so re-running is idempotent.
+    Returns {status: 'unchanged'|'committed'|'dry_run', commit?, report, chars}.
+    """
+    import base64
+    import datetime
+    import os
+    import requests
+    body, report = redact_cluster_notes(open(notes_path).read())
+    head = ("# %s\n\n> Mirrored automatically from the maintainer's working notes, with "
+            "personal identifiers replaced by `$USER`, `$HOME` and `<lab>`. Edits made "
+            "here are overwritten; open an issue instead.\n" % title)
+    out = head + "\n" + body.strip() + "\n"
+    if dry_run:
+        return {"status": "dry_run", "report": report, "chars": len(out), "text": out}
+    tok = os.environ[token_env]
+    H = {"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json"}
+    url = "https://api.github.com/repos/%s/contents/%s" % (repo, dest_path)
+    cur = requests.get(url, headers=H, params={"ref": branch})
+    sha = None
+    if cur.status_code == 200:
+        sha = cur.json()["sha"]
+        if base64.b64decode(cur.json()["content"]).decode() == out:
+            return {"status": "unchanged", "report": report, "chars": len(out)}
+    elif cur.status_code != 404:
+        raise RuntimeError("GitHub GET %s: %s" % (cur.status_code, cur.text[:200]))
+    owner = requests.get("https://api.github.com/repos/%s/commits/%s" % (repo, branch),
+                         headers=H).json()["commit"]["author"]
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    payload = {"message": "Sync %s (%s)" % (dest_path, stamp), "branch": branch,
+               "content": base64.b64encode(out.encode()).decode(),
+               "author": {"name": owner["name"], "email": owner["email"]}}
+    if sha:
+        payload["sha"] = sha
+    r = requests.put(url, headers=H, json=payload)
+    if r.status_code not in (200, 201):
+        raise RuntimeError("GitHub PUT %s: %s" % (r.status_code, r.text[:200]))
+    return {"status": "committed", "commit": r.json()["commit"]["sha"][:7],
+            "report": report, "chars": len(out)}
