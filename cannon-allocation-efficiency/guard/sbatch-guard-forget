@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Clear one signature's verdict after you have genuinely changed the job.
+# Deliberately a separate command: forgetting a measurement should be an act,
+# not a side effect of editing a script.
+set -euo pipefail
+L=~/.cache/sbatch_guard/ledger.json
+[ $# -eq 1 ] || { echo "usage: sbatch-guard-forget <signature>" >&2; exit 2; }
+python3 - "$1" <<'PY'
+import json, os, sys
+L = os.path.expanduser("~/.cache/sbatch_guard/ledger.json")
+d = json.load(open(L)) if os.path.exists(L) else {}
+if sys.argv[1] in d:
+    d.pop(sys.argv[1]); json.dump(d, open(L, "w"), indent=1, sort_keys=True)
+    print("forgot", sys.argv[1])
+else:
+    print("no such signature:", sys.argv[1]); sys.exit(1)
+PY

@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""sbatch guard - the chokepoint every CANNON submission passes through.
+
+WHY A SHIM AND NOT A CHECK YOU CALL
+
+A static check on a Snakefile covers only the jobs that come from a Snakefile.
+Measured on the 10 jobs in one real Job Defense Shield email: 5 carried a
+snakemake rule comment, and 5 were ad-hoc `sbatch` submissions with hand-written
+#SBATCH headers that no Snakefile check could ever see. An agent reaches for a
+one-off job constantly - probes, audits, cleanups - and those are exactly the
+submissions that skip every workflow-level guard.
+
+snakemake's SLURM executor shells out to `sbatch`, and so does every hand-rolled
+script. Putting the guard ON `sbatch` is therefore the only place that sees all
+of them. It refuses, it does not warn: a warning in a log an agent does not read
+is the thing that already failed.
+
+POLICY
+  * A job asking for 1 core always passes.
+  * An #ALLOC-OK token buys ONE run. If the job then measures oversized, the
+    claim is refuted and the signature is refused next time with the token still
+    in place -- otherwise the token is just a permanent off switch.
+  * A job asking for >1 core must EITHER have measured history showing it can
+    use them, OR carry an explicit justification token:
+        #ALLOC-OK: <reason>      (in the script)
+        --comment=alloc-ok:...   (on the command line)
+  * A job whose signature has measured history recommending FEWER cores than it
+    asks for is refused outright, with the numbers, regardless of the token.
+
+Set SBATCH_GUARD=off to bypass for one command. That is deliberate and logged:
+an escape hatch that leaves a trace is better than one an agent invents.
+"""
+import hashlib, json, os, re, shutil, subprocess, sys, time
+
+LEDGER = os.path.expanduser("~/.cache/sbatch_guard/ledger.json")
+LOG = os.path.expanduser("~/.cache/sbatch_guard/submissions.log")
+MAP = os.path.expanduser("~/.cache/sbatch_guard/jobid_sig.map")
+TOKEN = re.compile(r"#\s*ALLOC-OK\s*:", re.I)
+
+
+def real_sbatch():
+    me = os.path.realpath(__file__)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        cand = os.path.join(d, "sbatch")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK) \
+           and os.path.realpath(cand) != me:
+            return cand
+    for cand in ("/usr/bin/sbatch", "/bin/sbatch"):
+        if os.path.exists(cand):
+            return cand
+    sys.exit("sbatch-guard: cannot find the real sbatch")
+
+
+def cpus_from(argv, script):
+    for i, a in enumerate(argv):
+        m = re.match(r"^(?:-c|--cpus-per-task)(?:=(\d+))?$", a)
+        if m:
+            return int(m.group(1) or (argv[i + 1] if i + 1 < len(argv) else 1))
+        m = re.match(r"^-c(\d+)$", a)
+        if m:
+            return int(m.group(1))
+    m = re.search(r"(?m)^#SBATCH\s+(?:-c|--cpus-per-task)[=\s]+(\d+)", script)
+    return int(m.group(1)) if m else 1
+
+
+def signature(argv, script):
+    """Stable identity for 'this kind of job'.
+
+    Prefer the snakemake rule (its --comment), else the payload of the script
+    with volatile bits (paths with ids, dates, numbers) collapsed, so that the
+    same code submitted a hundred times hashes the same.
+    """
+    cmt = ""
+    for i, a in enumerate(argv):
+        if a.startswith("--comment="):
+            cmt = a.split("=", 1)[1]
+        elif a == "--comment" and i + 1 < len(argv):
+            cmt = argv[i + 1]
+    m = re.search(r"(rule_[A-Za-z0-9_]+?)(?:_wildcards_|$)", cmt)
+    if m:
+        return m.group(1)
+    body = [l for l in script.splitlines()
+            if l.strip() and not l.startswith("#!") and not l.startswith("#SBATCH")]
+    norm = re.sub(r"[0-9a-f]{8,}|\d+", "N", "\n".join(body))
+    return "adhoc_" + hashlib.blake2b(norm.encode(), digest_size=6).hexdigest()
+
+
+def main():
+    argv = sys.argv[1:]
+    script = ""
+    for a in argv:
+        if not a.startswith("-") and os.path.isfile(a):
+            try:
+                script = open(a).read()
+            except Exception:
+                pass
+    if not script and not sys.stdin.isatty():
+        try:
+            script = sys.stdin.read()
+        except Exception:
+            script = ""
+
+    if os.environ.get("SBATCH_GUARD", "").lower() in ("off", "0", "no"):
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as fh:
+            fh.write("%s BYPASS %s\n" % (time.strftime("%F %T"), " ".join(argv)[:200]))
+    else:
+        cpus = cpus_from(argv, script)
+        sig = signature(argv, script)
+        if cpus > 1:
+            led = {}
+            if os.path.exists(LEDGER):
+                try:
+                    led = json.load(open(LEDGER))
+                except Exception:
+                    led = {}
+            rec = led.get(sig)
+            if rec and rec.get("recommend", cpus) < cpus:
+                sys.stderr.write(
+                    "sbatch-guard: REFUSED.\n"
+                    "  signature : %s\n"
+                    "  requesting: %d cores\n"
+                    "  measured  : %.2f cores used, %.0f%% utilisation over %d job(s)\n"
+                    "  wasted so far: %.0f core-hours at this size.\n"
+                    "  Fix: set cpus-per-task to %d. Dropping idle cores does not slow\n"
+                    "  the job and needs no runtime increase.\n"
+                    "  If the measurement is stale: sbatch-guard-forget %s\n"
+                    % (sig, cpus, rec.get("cores_used", 0), 100 * rec.get("util", 0),
+                       rec.get("n_jobs", 0), rec.get("waste_core_h", 0),
+                       max(1, rec.get("recommend", 1)), sig))
+                sys.exit(1)
+            if rec and rec.get("token_refuted"):
+                sys.stderr.write(
+                    "sbatch-guard: REFUSED (justification refuted by measurement).\n"
+                    "  signature : %s\n"
+                    "  This job carried #ALLOC-OK and then measured %.2f cores of %d\n"
+                    "  (%.0f%%) over %d job(s). The token buys one run, not immunity.\n"
+                    "  Set cpus-per-task to %d, or re-measure and clear it with\n"
+                    "  sbatch-guard-forget %s\n"
+                    % (sig, rec.get("cores_used", 0), rec.get("alloc_cpus", 0),
+                       100 * rec.get("util", 0), rec.get("n_jobs", 0),
+                       max(1, rec.get("recommend", 1)), sig))
+                sys.exit(1)
+            if not rec and not TOKEN.search(script) and \
+               not any("alloc-ok" in a.lower() for a in argv):
+                sys.stderr.write(
+                    "sbatch-guard: REFUSED.\n"
+                    "  signature : %s (no measured history)\n"
+                    "  requesting: %d cores\n"
+                    "  A multi-core request with no evidence behind it is how a serial\n"
+                    "  job ends up holding a parallel reservation. Either:\n"
+                    "    - submit with 1 core, measure, and let the canary raise it, or\n"
+                    "    - add  #ALLOC-OK: <why this needs %d cores>  to the script.\n"
+                    % (sig, cpus, cpus))
+                sys.exit(1)
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as fh:
+            fh.write("%s PASS sig=%s cpus=%d\n" % (time.strftime("%F %T"), sig, cpus))
+        # Run sbatch rather than exec it, so the job id can be tied to the
+        # signature. Without this an AD-HOC job never accumulates history -- and
+        # ad-hoc jobs were half of the submissions in the real email, because
+        # only snakemake writes a rule name into --comment. The map is what lets
+        # the ledger learn about one-off scripts at all.
+        real = real_sbatch()
+        pr = subprocess.run([real] + argv, capture_output=True, text=True)
+        sys.stdout.write(pr.stdout)
+        sys.stderr.write(pr.stderr)
+        m = re.search(r"Submitted batch job (\d+)", pr.stdout or "")
+        if m:
+            with open(MAP, "a") as fh:
+                fh.write("%s %s %d\n" % (m.group(1), sig, cpus))
+        sys.exit(pr.returncode)
+
+    os.execv(real_sbatch(), [real_sbatch()] + argv)
+
+
+if __name__ == "__main__":
+    main()

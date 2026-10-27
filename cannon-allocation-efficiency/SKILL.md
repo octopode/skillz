@@ -76,6 +76,69 @@ to over-allocate:
 check_driver_script("snake_cannon.sh")        # [] means nothing to fix
 ```
 
+## The chokepoint: guard `sbatch` itself
+
+Everything above is a check *you have to remember to run*. That is not a gate,
+and the distinction is not academic: the failure that motivated this section
+happened in a project that already shipped this skill.
+
+**Measured on one real Job Defense Shield email — 10 flagged jobs:**
+
+| submission route | jobs | would a Snakefile check see it? |
+|---|---:|---|
+| snakemake rule (`rule_*` in `--comment`) | 5 | yes |
+| ad-hoc `sbatch` with hand-written `#SBATCH` | 5 | **no** |
+
+Half the flagged population never touches a Snakefile. Agents reach for one-off
+jobs constantly — probes, audits, cleanups, re-runs — and those skip every
+workflow-level guard. `check_allocations` cannot help with any of them.
+
+snakemake's SLURM executor shells out to `sbatch`, and so does every hand-rolled
+script, so **`sbatch` is the only place that sees all submissions**. `guard/`
+ships a shim to put ahead of the real one on `PATH`:
+
+```bash
+export PATH=/path/to/guard:$PATH     # in ~/.bashrc, and in any driver script
+sbatch-guard-learn 2026-10-23        # fold finished jobs into the ledger
+```
+
+Policy, in refusal order:
+
+1. 1 core — always passes.
+2. Signature has measured history recommending **fewer** cores than requested —
+   refused, with the measurement and the number to use.
+3. Signature carried `#ALLOC-OK` and then measured oversized — refused, token
+   still in place. **A justification buys one run, not immunity.** Without this
+   the token is a permanent off switch, which is precisely the shortcut to
+   expect.
+4. More than 1 core with no history and no `#ALLOC-OK: <reason>` — refused.
+   A multi-core request with no evidence behind it is the default-unsafe case.
+
+The shim runs `sbatch` rather than `exec`ing it so it can record
+`jobid -> signature`. Without that an ad-hoc script never accumulates history,
+because only snakemake writes a rule name into `--comment` — and ad-hoc jobs
+were half the problem.
+
+### What this does not cover
+
+State it plainly, because a guard believed to be airtight is worse than one
+known to be partial:
+
+* **`/usr/bin/sbatch`, `command sbatch`, or a `PATH` that lacks the shim.** The
+  shim is a convention, not a kernel. SLURM propagates the submitting
+  environment into job scripts by default, so a driver that has it keeps it, but
+  a login path that never sources `~/.bashrc` loses it.
+* **`srun` / `salloc`.** Interactive allocations bypass `sbatch` entirely.
+* **`SBATCH_GUARD=off`.** A deliberate, logged escape hatch — better than an
+  undocumented one an agent invents, but still an out.
+* **Signature churn.** An ad-hoc script edited between runs hashes differently
+  and starts with no history. The normalisation collapses digits and hex ids to
+  blunt this; it does not eliminate it.
+
+Every one of these shows up in `sacct` afterwards, so the audit below is the
+backstop, and the two are meant to be run together: the shim stops the common
+case before it is charged, the ledger catches what got around it.
+
 ## The canary: decide before the queue is charged
 
 The audit sections below run *after* a stage finishes. That is too late for a

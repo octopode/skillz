@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Fold finished jobs into the guard's ledger, so the refusal is evidence-based.
+
+Run it on a schedule (cron / after each campaign). It reads sacct, computes
+UTILISATION - TotalCPU / (AllocCPUS x Elapsed), which is what the abuse monitor
+reads, not average cores - and records a verdict per signature.
+
+A signature is marked "serial" when it used roughly one core while holding
+several, which is the pattern that generates the email. From then on the shim
+refuses that signature at >1 core and says what to ask for instead.
+"""
+import collections, json, os, re, subprocess, sys
+
+LEDGER = os.path.expanduser("~/.cache/sbatch_guard/ledger.json")
+TARGET_UTIL = 0.90
+
+
+def secs(t):
+    if not t:
+        return 0.0
+    d, _, rest = t.partition("-")
+    if rest:
+        h, m, s = rest.split(":")
+        return int(d) * 86400 + int(h) * 3600 + int(m) * 60 + float(s)
+    p = t.split(":")
+    if len(p) == 3:
+        return int(p[0]) * 3600 + int(p[1]) * 60 + float(p[2])
+    if len(p) == 2:
+        return int(p[0]) * 60 + float(p[1])
+    try:
+        return float(t)
+    except ValueError:
+        return 0.0
+
+
+def main():
+    user = os.environ.get("USER")
+    since = sys.argv[1] if len(sys.argv) > 1 else "now-3days"
+    out = subprocess.run(
+        ["sacct", "-u", user, "-S", since, "-P", "--format",
+         "JobID,JobName,AllocCPUS,Elapsed,TotalCPU,State,Comment"],
+        capture_output=True, text=True).stdout.splitlines()
+    # job id -> signature, written by the shim at submit time. This is the only
+    # way an ad-hoc script (no rule name in --comment) ever gets a verdict.
+    jobsig = {}
+    MAP = os.path.expanduser("~/.cache/sbatch_guard/jobid_sig.map")
+    if os.path.exists(MAP):
+        for ln in open(MAP):
+            f = ln.split()
+            if len(f) >= 2:
+                jobsig[f[0]] = f[1]
+    jobs = collections.defaultdict(lambda: {"cpus": 0, "el": 0.0, "tot": 0.0,
+                                            "cmt": "", "name": "", "state": "",
+                                            "id": ""})
+    for ln in out[1:]:
+        f = ln.split("|")
+        if len(f) < 7:
+            continue
+        jid, name, cpus, el, tot, state, cmt = f[:7]
+        # TotalCPU lives on the .batch/.N steps; the -X allocation row reads zero
+        j = jobs[jid.split(".")[0]]
+        j["tot"] = max(j["tot"], secs(tot))
+        if "." not in jid:
+            j.update(cpus=int(cpus or 0), el=secs(el), cmt=cmt, name=name,
+                     state=state, id=jid)
+    agg = collections.defaultdict(lambda: [0, 0.0, 0.0, 0])
+    for j in jobs.values():
+        if not j["cpus"] or j["el"] <= 0 or not j["state"].startswith("COMPLETED"):
+            continue
+        m = re.search(r"(rule_[A-Za-z0-9_]+?)(?:_wildcards_|$)", j["cmt"] or "")
+        sig = m.group(1) if m else jobsig.get(j["id"])
+        if not sig:
+            continue          # submitted before the guard was installed
+        a = agg[sig]
+        a[0] += 1
+        a[1] += j["cpus"] * j["el"]
+        a[2] += j["tot"]
+        a[3] = max(a[3], j["cpus"])
+    led = {}
+    if os.path.exists(LEDGER):
+        try:
+            led = json.load(open(LEDGER))
+        except Exception:
+            led = {}
+    for sig, (n, res, used, cpus) in agg.items():
+        util = used / res if res else 0.0
+        cores = used / (res / cpus) if res else 0.0
+        # Recommend the smallest core count that still covers measured use, with
+        # a little headroom. The VERDICT then keys on whether that is smaller
+        # than what was reserved -- the actionable condition -- rather than on
+        # utilisation alone. A rule measuring 1.29 cores of 2 is not "serial",
+        # and saying so while recommending 2 cores would be incoherent.
+        # Round, do not ceil. These rules cap library threads from {threads}, so
+        # a measurement of 1.29 cores on 2 becomes ~1.0 on 1 - the extra 0.29 is
+        # BLAS threads that simply are not spawned, costing some wall time, not
+        # an oversubscription. For a GENUINELY parallel tool (mafft --thread N)
+        # use ceil instead, or it will be throttled: see SKILL.md.
+        rec = max(1, int(cores + 0.5 + 1e-9))
+        led[sig] = {"n_jobs": n, "util": round(util, 3),
+                    "cores_used": round(cores, 2), "alloc_cpus": cpus,
+                    "recommend": rec,
+                    "waste_core_h": round((res - used) / 3600, 1),
+                    "verdict": ("oversized" if rec < cpus else "ok")}
+        # An #ALLOC-OK token buys ONE run, not permanent immunity. If a job
+        # asserted it needed the cores and then measured oversized, the claim is
+        # refuted: record it so the shim refuses that signature NEXT time even
+        # though the token is still sitting in the script. Otherwise the token
+        # is just a way to switch the guard off and leave it off.
+        if rec < cpus:
+            led[sig]["token_refuted"] = True
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    json.dump(led, open(LEDGER, "w"), indent=1, sort_keys=True)
+    bad = {k: v for k, v in led.items() if v["verdict"] == "oversized"}
+    print("ledger: %d signatures, %d oversized -> %s" % (len(led), len(bad), LEDGER))
+    for k, v in sorted(bad.items(), key=lambda kv: -kv[1]["waste_core_h"]):
+        print("  %-42s %4.2f cores of %d (%2.0f%%), n=%4d -> %d core%s  [wasted %.0f core-h]"
+              % (k, v["cores_used"], v["alloc_cpus"], 100 * v["util"], v["n_jobs"],
+                 v["recommend"], "" if v["recommend"] == 1 else "s", v["waste_core_h"]))
+
+
+if __name__ == "__main__":
+    main()
