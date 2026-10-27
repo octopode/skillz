@@ -4,12 +4,10 @@ description: "Verify that cluster jobs can actually saturate the CPU cores and m
 metadata:
   authored_via: "claude-science"
   published_by: "agent"
-  published_at: "2026-10-13T14:07:18.747Z"
-  authored_by: "agent"
-  authored_at: "2026-10-13T14:07:04.548Z"
-  authoring_session: "bf573051-5ad9-4c15-9728-cfc8fe6f8ac6"
+  published_at: "2026-10-21T15:35:01.088Z"
+  authored_by: "unknown"
   last_modified_by: "agent"
-  last_modified_at: "2026-10-13T14:07:04.553Z"
+  last_modified_at: "2026-10-21T15:35:00.584Z"
 ---
 
 # Cluster allocation efficiency
@@ -30,7 +28,7 @@ from pprint import pprint
 pprint(check_allocations("Snakefile"))        # [] means nothing to fix
 ```
 
-It flags four failure modes, all of which have shipped to a real cluster:
+It flags five failure modes, all of which have shipped to a real cluster:
 
 1. **Reserves cores, never passes them.** `threads: 8` with a shell command that
    never interpolates `{threads}`. The rule gets 8 cores and runs single-threaded.
@@ -42,6 +40,18 @@ It flags four failure modes, all of which have shipped to a real cluster:
    samtools and friends default to *every visible core*. Inside a worker loop that
    is already parallel, N workers x N cores oversubscribes the allocation and
    everything slows down.
+5. **`{threads}` used only to CAP library threads.** `threads: 2` with a command
+   whose every use of `{threads}` is `OMP_NUM_THREADS={threads}` (or OPENBLAS,
+   MKL, NUMEXPR, RAYON...). This *passes* check 1 while being the exact idiom of a
+   serial Python loop hoping BLAS will fill the reservation. It usually doesn't:
+   per-column work on small matrices is dominated by interpreter overhead, and the
+   job lands at ~100%/N — the Job Defense Shield signature. Setting a thread cap
+   is not evidence of parallelism. If you have **measured** that library
+   parallelism fills the cores, put `allocation-ok: blas-parallel measured` in the
+   rule body and the check stands down.
+
+   This one is written from a real email. 133 jobs over a week, 2 cores at ~48%
+   and 4 cores at ~22%, every rule dutifully passing `{threads}` into BLAS caps.
 
 Then check anything that splits work across a pool:
 
@@ -58,6 +68,44 @@ over 8 workers, hence 7 slices, and one core still sits idle.
 Passing `{threads}` is necessary and **not sufficient**. The question to ask of
 every rule is not "did we pass threads" but **"can this code fill what we
 reserved"**.
+
+Check the driver's own submission script too — it is a job, and the easiest one
+to over-allocate:
+
+```python
+check_driver_script("snake_cannon.sh")        # [] means nothing to fix
+```
+
+## The canary: decide before the queue is charged
+
+The audit sections below run *after* a stage finishes. That is too late for a
+workflow that dispatches hundreds of jobs: by the time you can measure, the
+core-hours are spent and the abuse email is already written. A 166-batch stage
+had tripped the monitor long before anyone could have audited it.
+
+**Once a handful of jobs of a NEW rule have completed, get a verdict and act on
+it.**
+
+```python
+txt = subprocess.run(["sacct","-u",user,"-S",today,"-P","--format",
+                      "JobID,JobName,Partition,AllocCPUS,ReqMem,Elapsed,"
+                      "TotalCPU,MaxRSS,State,Comment"],
+                     capture_output=True, text=True).stdout
+v = canary_verdict(txt, rule="phylanova_null_batch")
+# {'verdict': 'stop', 'util': 0.484, 'cores_used': 0.97, 'advice': '...set threads: 1...'}
+if v["verdict"] == "stop":
+    ...   # scancel the pending queue, fix threads, resubmit
+```
+
+`verdict` is `"wait"` until `min_jobs` have completed, then `"go"` or `"stop"`.
+It measures **utilisation** — `TotalCPU / (AllocCPUS x Elapsed)` — not average
+cores, because that is what the monitor reads (see the section below). A
+single-core rule can never fail it.
+
+Cancelling a pending queue to re-submit at the right size is nearly free; the
+jobs have not run. This is the opposite of the "finishing a running job can be
+the frugal choice" case further down, and the difference is whether the work has
+already been done.
 
 ## While it runs
 
@@ -535,4 +583,13 @@ asserted empty:
 ```python
 def test_every_rule_can_use_its_cores():
     assert check_allocations("Snakefile") == []
+
+def test_driver_is_not_over_allocated():
+    assert check_driver_script("snake_cannon.sh") == []
 ```
+
+And make the canary a step in the launcher rather than a thing you remember to
+do: submit the first batch, wait for it, `canary_verdict(...)`, abort the run if
+it says stop. A gate you have to remember is advice; a gate in the launcher is a
+gate. The failure that motivated check 5 happened in a project that already had
+this skill — the author knew the rule and did not run the check.

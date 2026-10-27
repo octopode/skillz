@@ -1,9 +1,21 @@
 """Helpers for cluster allocation checks. See SKILL.md."""
+import math
 import re
 
 THREAD_HUNGRY = ("diamond", "mafft", "blastp", "blastx", "hmmsearch", "hmmscan",
                  "bowtie2", "bwa", "minimap2", "samtools", "mmseqs", "cd-hit",
                  "muscle", "iqtree", "raxml")
+# Environment variables that CAP a library's thread count. Setting one from
+# {threads} is not evidence that anything is parallel -- it is the idiom used
+# when a serial loop hopes BLAS will fill the reservation.
+THREAD_CAP_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                  "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+                  "GOTO_NUM_THREADS", "BLIS_NUM_THREADS", "JULIA_NUM_THREADS",
+                  "POLARS_MAX_THREADS", "RAYON_NUM_THREADS")
+# Put this in a rule body to assert you MEASURED that library parallelism fills
+# the reservation. check_allocations then stops flagging it.
+BLAS_PARALLEL_OPT_OUT = "allocation-ok: blas-parallel measured"
+
 THREAD_FLAGS = ("--threads", "-p ", "-@", "--cpu", "--nthreads", "-nt", "--thread",
                 "{threads}")
 
@@ -58,6 +70,22 @@ def check_allocations(snakefile_path, mem_ceiling_mb=32000, batch_hint="batch",
             findings.append({"rule": name, "issue": "threads_not_passed",
                              "detail": "reserves %d cores but never interpolates "
                                        "{threads} into its command" % n})
+        elif n > 1 and BLAS_PARALLEL_OPT_OUT not in body:
+            # {threads} IS passed, so the check above is satisfied -- but if every
+            # use of it only CAPS a library's thread count, nothing in the rule has
+            # been shown to use more than one core. This is the Job Defense Shield
+            # signature, catchable before submission: N cores at ~100%/N.
+            uses = [m.start() for m in re.finditer(r"\{threads\}", code)]
+            capped = sum(bool(re.search(r"(%s)\s*=\s*$" % "|".join(THREAD_CAP_ENV),
+                                        code[max(0, i - 60):i])) for i in uses)
+            if uses and capped == len(uses):
+                findings.append({"rule": name, "issue": "blas_env_only_threads",
+                                 "detail": "reserves %d cores and uses {threads} only to "
+                                           "CAP library threads (%s); nothing here is shown to "
+                                           "use more than one core. Measure it, then set "
+                                           "threads: 1 or add the marker %r"
+                                           % (n, ", ".join(e for e in THREAD_CAP_ENV if e in code)
+                                              or "thread caps", BLAS_PARALLEL_OPT_OUT)})
         if batch_hint in name:
             if not mem:
                 findings.append({"rule": name, "issue": "no_mem",
@@ -518,3 +546,86 @@ def publish_cluster_notes(notes_path, repo, dest_path, title, branch="main",
         raise RuntimeError("GitHub PUT %s: %s" % (r.status_code, r.text[:200]))
     return {"status": "committed", "commit": r.json()["commit"]["sha"][:7],
             "report": report, "chars": len(out)}
+
+
+def check_driver_script(path_or_text, max_driver_cpus=1):
+    """Flag a workflow-driver submission script that reserves more than one core.
+
+    A driver polls squeue, parses, and sleeps. It cannot use a second core, and
+    because it is long-lived it is often the single largest waste in a campaign.
+    Measured on a real sweep: 13 drivers reserved 91.3 core-h and used 2.7.
+
+    Detects a driver by the presence of a `snakemake` invocation (not `--dry-run`
+    /`-n` only) alongside SBATCH directives. Returns [] when nothing is wrong.
+    """
+    import os
+    text = (open(path_or_text).read()
+            if os.path.exists(str(path_or_text)) else str(path_or_text))
+    low = text.lower()
+    runs_wf = bool(re.search(r"(?m)^\s*(snakemake|nextflow|cromwell)\b", low))
+    if not runs_wf:
+        return []
+    # a script that ONLY dry-runs is not a driver holding an allocation for hours
+    real = [l for l in low.splitlines()
+            if re.match(r"\s*(snakemake|nextflow|cromwell)\b", l)
+            and not re.search(r"(^|\s)(-n|--dry-run|--lint|--unlock)(\s|$)", l)]
+    if not real:
+        return []
+    out = []
+    m = re.search(r"(?m)^#SBATCH\s+(?:-c|--cpus-per-task[= ])\s*(\d+)", text)
+    cpus = int(m.group(1)) if m else None
+    if cpus is not None and cpus > max_driver_cpus:
+        out.append({"rule": "<driver script>", "issue": "driver_over_allocated",
+                    "detail": "driver reserves %d cores; it polls and sleeps, so it "
+                              "cannot use more than %d. Size wall time instead."
+                              % (cpus, max_driver_cpus)})
+    mm = re.search(r"(?m)^#SBATCH\s+--mem[= ]\s*(\d+)\s*([GM])", text, re.I)
+    if mm and mm.group(2).upper() == "G" and int(mm.group(1)) > 8:
+        out.append({"rule": "<driver script>", "issue": "driver_memory_high",
+                    "detail": "driver reserves %sG; a snakemake driver's peak RSS is "
+                              "typically 1-2G" % mm.group(1)})
+    return out
+
+
+def canary_verdict(source, rule=None, min_jobs=3, target_util=0.90,
+                   serial_slack=0.10):
+    """STOP/GO on the first finished jobs of a rule, before the rest are charged.
+
+    Auditing after a stage finishes is too late: a workflow that dispatches
+    hundreds of jobs has already spent the core-hours (and tripped the abuse
+    monitor) by the time the audit runs. Run this once a handful of jobs of a NEW
+    rule have completed, and act on it.
+
+    `source` is `sacct -P` text (with header) or parse_sacct() records.
+    Returns {verdict, rule, n_jobs, util, alloc_cpus, cores_used, advice}.
+    verdict is "go", "stop" or "wait" (fewer than min_jobs finished).
+
+    "stop" means: cancel the queue, change the allocation, resubmit. The
+    recommended `threads` is the measured core count rounded up, never below 1.
+    """
+    recs = parse_sacct(source) if isinstance(source, str) else list(source)
+    rows = [r for r in recs
+            if r.get("elapsed_s", 0) > 0 and r.get("alloc_cpus", 0) > 0
+            and str(r.get("state", "")).upper().startswith("COMPLETED")
+            and (rule is None or r.get("rule") == rule)]
+    if len(rows) < min_jobs:
+        return {"verdict": "wait", "rule": rule, "n_jobs": len(rows),
+                "util": None, "advice": "need %d completed jobs, have %d"
+                                        % (min_jobs, len(rows))}
+    res = sum(r["alloc_cpus"] * r["elapsed_s"] for r in rows)
+    used = sum(r["total_cpu_s"] for r in rows)
+    util = used / res if res else 0.0
+    cpus = max(r["alloc_cpus"] for r in rows)
+    cores = used / sum(r["elapsed_s"] for r in rows)
+    ok = util >= target_util or cpus == 1
+    rec = max(1, math.ceil(cores - serial_slack))
+    return {"verdict": "go" if ok else "stop", "rule": rule, "n_jobs": len(rows),
+            "util": round(util, 3), "alloc_cpus": cpus,
+            "cores_used": round(cores, 2),
+            "advice": ("utilisation %.0f%% of %d cores clears the %.0f%% target"
+                       % (100 * util, cpus, 100 * target_util)) if ok else
+                      ("utilisation %.0f%% on %d cores (measured %.2f cores). "
+                       "Job Defense Shield flags ~%.0f%%. Cancel the queue, set "
+                       "threads: %d, resubmit -- dropping idle cores does not slow "
+                       "the rule and needs no runtime increase."
+                       % (100 * util, cpus, cores, 100.0 / cpus, rec))}
