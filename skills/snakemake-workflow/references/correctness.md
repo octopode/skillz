@@ -436,6 +436,22 @@ Prefer `script:` over `shell:` for anything with logic. The script receives a
 script has no CLI to keep in sync. Paths in `script:` are relative to the rule
 file, not the working directory.
 
+Snakemake does not execute your script file. It writes a copy into
+`.snakemake/scripts/` with a preamble prepended — that preamble is what defines
+the `snakemake` object — and runs the copy. Two consequences:
+
+- **A `from __future__ import ...` line at the top of your script is no longer
+  at the top of the file that runs.** Every job of that rule dies with
+  `SyntaxError: from __future__ imports must occur at the beginning of the
+  file`, pointing at a line in a `tmp*.py` you never wrote. There is nowhere in
+  a `script:` file the import can legally go, so remove it and quote any
+  forward-referenced annotation instead. Verified on 9.27 with a Python
+  `script:`.
+- **A compile-time failure leaves the rule's `log:` file empty**, because the
+  script's first statement — including whatever redirects `stderr` to that log —
+  never runs. The traceback appears in the Snakemake console output only. Empty
+  log plus non-zero exit means read the console, not the log.
+
 Keep assertions in the script rather than only in review. A script that checks
 its own assumption — the join produced no unexpected nulls, the parser found as
 many records as the header claimed — turns a silent wrong answer into a failed

@@ -4,10 +4,10 @@ description: "Verify that cluster jobs can actually saturate the CPU cores and m
 metadata:
   authored_via: "claude-science"
   published_by: "agent"
-  published_at: "2026-10-21T15:35:01.088Z"
+  published_at: "2026-10-27T15:26:43.478Z"
   authored_by: "unknown"
   last_modified_by: "agent"
-  last_modified_at: "2026-10-21T15:35:00.584Z"
+  last_modified_at: "2026-10-27T15:07:33.209Z"
 ---
 
 # Cluster allocation efficiency

@@ -4,10 +4,10 @@ description: "Build, extend and review Snakemake workflows to upstream best prac
 metadata:
   authored_via: "claude-science"
   published_by: "agent"
-  published_at: "2026-10-13T14:23:53.848Z"
+  published_at: "2026-10-22T21:48:29.637Z"
   authored_by: "unknown"
   last_modified_by: "agent"
-  last_modified_at: "2026-10-13T14:22:18.291Z"
+  last_modified_at: "2026-10-22T21:35:34.428Z"
 ---
 
 # Snakemake workflows
@@ -74,7 +74,7 @@ Run them in the environment that has Snakemake installed.
 ```bash
 snakemake --lint                    # workflow-level code quality
 snakefmt --check workflow/          # formatting (pip install snakefmt)
-snakemake -n                        # does the DAG still build, and what reruns
+snakemake -n --use-conda            # does the DAG still build, and what reruns
 snakemake --rulegraph | dot -Tpdf -o dag.pdf
 ```
 
@@ -100,6 +100,14 @@ lint reads text, not structure, is what lets you tell a real finding from this.
 rerun*. If it wants to redo work you thought was done, that's `--rerun-triggers`
 telling you something changed — see below. A clean run prints `Nothing to be
 done`.
+
+**Pass the deployment flags to the dry run too.** On a workflow that ran under
+`--use-conda`, a bare `snakemake -n` reports every `conda:` rule as needing a
+rerun, with the reason *"software environment definition has changed since last
+execution"* — the environment is not deployed during a dry run, so the hash it
+compares against the recorded one does not match, and the `software-env` trigger
+fires on a workflow where nothing changed. `snakemake -n --use-conda` on the
+same workflow prints `Nothing to be done`. Verified on 9.27.
 
 Then, once the workflow runs:
 
@@ -148,6 +156,15 @@ explanations and fixes in `references/correctness.md`.
    says `Nothing to be done` and the output still differs. Grep the whole tree,
    and measure the run-to-run overlap before interpreting any parameter sweep —
    an unseeded stage becomes the sweep's noise floor.
+
+Two more bite on the first run rather than the hundredth, and both are written
+up in the references. A `script:` file must not begin with `from __future__
+import ...`: Snakemake prepends its own preamble to a copy of the script, so the
+import is no longer first and every job of that rule dies with a `SyntaxError`
+naming a temporary file, while the rule's `log:` stays empty. And `--sdm conda`
+cannot build an environment when the conda *installation* directory is
+read-only — set `CONDA_PKGS_DIRS` to somewhere writable and
+`CONDA_REGISTER_ENVS=false`, or watch a fully built env roll itself back.
 
 ## Declaring compute
 

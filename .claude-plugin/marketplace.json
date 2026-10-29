@@ -1,0 +1,28 @@
+{
+  "name": "skillz",
+  "owner": {
+    "name": "Jacob Winnikoff"
+  },
+  "metadata": {
+    "description": "Agent skills for reproducible Snakemake pipelines and efficient SLURM cluster use.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "skillz",
+      "description": "Snakemake workflow best practice, plus checks that SLURM jobs actually use the cores and memory they reserve.",
+      "version": "1.0.0",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/snakemake-workflow",
+        "./skills/cannon-allocation-efficiency"
+      ],
+      "author": {
+        "name": "Jacob Winnikoff"
+      },
+      "license": "MIT",
+      "homepage": "https://github.com/octopode/skillz"
+    }
+  ]
+}

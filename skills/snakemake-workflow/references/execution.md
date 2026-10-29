@@ -69,6 +69,25 @@ Envs are cached per-workflow under `.snakemake/conda`, keyed by the env file's
 content — editing an env file creates a new env and reruns its rules (the
 `software-env` rerun trigger).
 
+**When the conda installation directory is read-only.** Creating an env writes
+to three places: the package cache, the env prefix under `.snakemake/conda`, and
+conda's own registry at `~/.conda/environments.txt`. On a shared, managed or
+sandboxed install, the first and third can be unwritable while the workflow
+directory is fine. Two conda settings fix it without touching the installation:
+
+```bash
+export CONDA_PKGS_DIRS=/some/writable/dir   # else: NoWritablePkgsDirError
+export CONDA_REGISTER_ENVS=false            # else the env builds, then rolls back
+```
+
+The second failure is the one that wastes an afternoon: conda downloads and
+links the entire environment, prints `Executing transaction: ...done`, then
+rolls the transaction back and reports `[Errno 1] Operation not permitted:
+'~/.conda/environments.txt'`. The registry write is the last step, and failing
+it discards everything before it. Both are conda settings rather than Snakemake
+ones, so they belong in the operator's environment, not in the workflow.
+Verified with conda 26.7.2 under Snakemake 9.27.
+
 ## Profiles
 
 Two kinds, and conflating them is why profiles get copied between machines and
