@@ -190,7 +190,7 @@ burst as scheduler contention rather than a workflow fault.
 
 `dot` is at `/usr/bin/dot` (graphviz 2.40.1) on compute nodes and also in `envs/prefixes/pa-flow/bin/dot`; no `module avail graphviz`. Tarballs built on macOS and unpacked on CANNON drop AppleDouble `._*` files (and `tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr...'` warnings) next to every extracted file — remove them before `git status` is read. Snakemake 9.x has no `--reason` flag (reasons print by default under `-n`); passing it exits 2 before the DAG is built.
 
-### BosLFS02 can stall cluster-wide while the status page says Operational (observed 2026-10-19)
+### BosLFS02 can stall cluster-wide while the status page says Operational (observed 2026-10-19; VOLUME RETIRED 2026-10-28 — kept because the lesson generalises to any volume)
 
 From ~13:24 to 15:22 EDT every access under `/n/boslfs02` (even `ls /n/boslfs02`) hung on holylogin06 and on compute nodes in both families (holy8a, holy7c); fasrc.instatus.com listed "BosLFS02 (Tier 0)" OPERATIONAL throughout. Symptom from the harness: `call_command` hits its 60 s cap with no output. Probe with `timeout 20 ls -d <path>; echo rc=$?` (124 = hung) rather than bare commands, and don't submit jobs that touch the tree until it returns — a job that `cd`s in can then block for its whole walltime in uninterruptible I/O. It recovered without intervention; netscratch (`/n/netscratch`) and home stayed usable during the stall.
 
@@ -210,3 +210,71 @@ MaxArraySize=10000 bounds the task INDEX (`--array=0-9999` ok, `1-10000` rejecte
 Do NOT use snakemake `--slurm-array-jobs` with the pa-flow env's executor plugin 2.8.0 / jobstep 0.6.1: tasks delete/require the first task's output (upstream #488), sibling status is mis-mapped under the default sacct status query, and `--jobs` below half the ready jobs deadlocks (SIGTERM does not end it; needs SIGKILL). Details and re-test probe in the cannon-allocation-efficiency skill.
 
 Snakemake 9 `--config` keys must be >= 2 characters (`n=12` -> "Config entry must start with a valid identifier").
+### STORAGE MIGRATED OFF BosLFS02 (2026-10-28) — read this before trusting any path above
+
+FASRC moved lab storage off BosLFS02. `/n/boslfs02` no longer exists at all: not
+the project tree, the whole mount point, on login and compute nodes alike. Every
+`/n/boslfs02/LABS/<lab>/...` path written anywhere above is dead, and the
+BosLFS02 sections are kept only as history of a volume that is gone.
+
+**The new path is NOT the one in the migration email.** FASRC's notice said
+`/n/lab_storage/LABS/<lab>`. The actual layout has no `LABS/` component — labs
+sit directly under `/n/lab_storage`:
+
+```
+/n/lab_storage/<lab>/Users/<user>/<project>      # correct
+/n/lab_storage/LABS/<lab>/...                    # as emailed; does not exist
+```
+
+`/n/lab_storage` is NFS (`lab-storage-nfs:/ifs/rc_labs`, 41P), not Lustre. The
+old volume was Lustre, so guidance above that reasons about Lustre behaviour —
+small-file load, journal commits — no longer describes the project tree. The
+advice to keep high-churn small-file traffic on `/n/netscratch` still stands;
+the reason is now ordinary NFS metadata cost.
+
+**Mount timing differs between node classes.** Immediately after the migration
+`/n/lab_storage` resolved on compute nodes while the login node returned
+"No such file or directory" for the same path, and a stale `/n/<lab>`
+autofs entry listed in `ls /n/` but refused to mount. A path that fails on the
+login node is therefore not evidence the data is gone — retry it from a
+submitted job before concluding anything.
+
+**What the migration broke: conda prefix envs.** Data came through intact
+(checksums, setgid bits, group-writable modes all preserved, despite the email
+warning that fACLs were not carried over). The environments did not. Every
+console entry point under `envs/prefixes/*/bin/` carries an absolute shebang:
+
+```
+#!/n/boslfs02/LABS/<lab>/Users/<user>/<project>/envs/prefixes/pa-flow/bin/python3.12
+```
+
+That interpreter no longer exists, so `snakemake`, `micromamba run -p ...` and
+every other entry point fail *before Python starts* — with a bare
+"No such file or directory" and no traceback. The env contents are fine; only
+the shebangs are stale. Two things follow:
+
+* Immediate workaround, no repair needed: `<prefix>/bin/python3 -m snakemake ...`
+  bypasses the shebang entirely.
+* Repair: rewrite the old prefix to the new one in the env's text files. Measured
+  here: 291 files rewritten across 8 envs, 174 of them dead shebangs. Scope it to
+  `envs/prefixes/*/bin/*` and `envs/prefixes/*/etc/conda/*/*` — a recursive
+  `grep -rIl` over whole conda trees on NFS ran 33 minutes without finishing and
+  had to be abandoned. Binaries that embed the prefix are padded by conda for
+  relocation and can be left alone.
+
+After repair, verify all three: `snakemake --version` on PATH,
+`micromamba run -p envs/prefixes/<env> python -c 'import ...'`, and
+`micromamba run -p envs/prefixes/pa-flow snakemake --version`.
+
+**Checklist after a storage migration here**, in the order that mattered:
+
+1. Find the real path from a compute node, not the email.
+2. Confirm the data: file counts, sizes, and that output dirs are still writable
+   with setgid intact.
+3. Repair the conda prefixes before anything else — nothing else can run.
+4. Grep the repo for the old path. Live scripts (`scripts/*.sbatch` especially)
+   will `cd` to it and fail; documentation needs updating; historical narrative
+   in decision logs should keep the old path and be marked as history.
+5. Dry-run the whole workflow and read the job counts before launching anything.
+   A volume move changes mtimes, and the question "does this reschedule finished
+   work" has to be answered from the dry run, not assumed.
