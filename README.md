@@ -8,6 +8,7 @@ under [`skills/`](skills/): a `SKILL.md` with YAML frontmatter (`name`,
 |---|---|
 | [`snakemake-workflow`](skills/snakemake-workflow/) | Building, extending and reviewing Snakemake workflows to upstream best practice: the official layout, the `--lint` / `snakefmt` / `--report` / `--containerize` / `--generate-unit-tests` toolchain, DAG and wildcard semantics that cause real bugs, conda deployment pitfalls, and threads/resources for local and cluster execution. References are in `references/`. |
 | [`cannon-allocation-efficiency`](skills/cannon-allocation-efficiency/) | Checking that cluster jobs can actually saturate the CPU cores and memory they reserve, both before submitting and after running: `{threads}` pass-through, worker pools, nested-parallelism oversubscription, batch granularity, reserved-vs-used audits from `sacct` and Snakemake benchmark records, and SLURM job arrays (limits, `%N` throttles, per-task accounting, and why Snakemake's `--slurm-array-jobs` is unsafe in executor plugin 2.8.0; `array_probe/` holds the test workflow). `guard/` ships an `sbatch` shim that checks every submission. Written against Harvard FASRC's Cannon cluster, but applies to any SLURM site. |
+| [`openathens-fetch`](skills/openathens-fetch/) | Downloading paywalled journal PDFs through your own library OpenAthens login (Claude Science on macOS). A Chrome login window, run outside the sandbox, captures only the identity cookies (OpenAthens plus your institution's login site); the agent replays them through the publisher SAML chain, re-authenticates silently while your institution session lives, and opens the login window again (optionally by itself, via a LaunchAgent) when it does not. Defaults to Harvard Library; any OpenAthens institution works. Setup is in the skill's `README.md`. |
 
 `snakemake-workflow` hands cluster-sizing questions off to
 `cannon-allocation-efficiency`, so install both together.
@@ -15,12 +16,12 @@ under [`skills/`](skills/): a `SKILL.md` with YAML frontmatter (`name`,
 ## Installing
 
 **Claude Science:** Settings > Skills > Add skill > **Import from GitHub**, and
-paste `https://github.com/octopode/skillz`. Both skills are imported from the
+paste `https://github.com/octopode/skillz`. All skills are imported from the
 default branch, and Claude Science records the commit they came from. Imported
 skills do not update on their own: use **Check for updates…** on the repo's entry
 under Settings > Skills > Imported to pull newer commits.
 
-**Claude Code:**
+**Claude Code** (`openathens-fetch` is Claude Science-only and is not in the plugin):
 
 ```
 /plugin marketplace add octopode/skillz
@@ -39,6 +40,9 @@ automatically. Anywhere else, run `from kernel import *` from the skill folder
 The `guard/` scripts run on the cluster, not in the agent. Copy them to the
 cluster, then `chmod +x` them, since an import may not keep the executable bit.
 Put the folder ahead of the real `sbatch` on `PATH`, as the skill describes.
+
+`openathens-fetch` copies its `launcher/` into a session folder with `oa_install()`,
+which sets the executable bits itself; see `skills/openathens-fetch/README.md`.
 
 ## Cluster notes
 
