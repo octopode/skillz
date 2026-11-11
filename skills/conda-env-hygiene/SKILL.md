@@ -46,6 +46,7 @@ new one.
 | `conda_env_yml(env, path)` | write a from-history `environment.yml` (pip section included) |
 | `conda_yml_to_create(path)` | turn an `environment.yml` into `manage_environments` arguments |
 | `conda_env_audit(env, check_channels=False)` | drift and conda/pip-order findings |
+| `conda_sidecar_imports(globals())` | third-party modules the loaded skills' `kernel.py` files import |
 | `conda_env_names()`, `conda_installed(env)`, `conda_env_subdir(env)` | building blocks |
 
 They read `conda-meta/history` (the `# update specs` / `# remove specs` lines, i.e.
@@ -60,8 +61,8 @@ is denylisted in the sandbox.
 ## Workflow: a task needs packages
 
 1. **Write down the complete list** the task will need, including what loaded
-   skills' `kernel.py` files import (see pitfalls) and `pip` if any PyPI-only package
-   is expected. Decide the project: the granted folder or repo being worked on, or,
+   skills' `kernel.py` files import (`conda_sidecar_imports(globals())`; do not
+   search the filesystem for them) and `pip` if any PyPI-only package is expected. Decide the project: the granted folder or repo being worked on, or,
    if there is none, the tool stack (e.g. `geospatial`, `browser`).
 2. **Starter envs (`python`, `r`)**: never install into, rebuild or delete them,
    even when the audit flags drift: they are the app's, shared by every project, and

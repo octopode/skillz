@@ -1,4 +1,5 @@
 """conda-env-hygiene helpers. Standard library only, so the file loads in any env."""
+import ast
 import datetime
 import glob
 import gzip
@@ -296,4 +297,41 @@ def conda_yml_to_create(path):
                 out["python_version"] = m.group(1)
             else:
                 out["packages"].append(item)
+    return out
+
+
+def conda_sidecar_imports(namespace):
+    """Third-party modules imported by the skill sidecars loaded in this kernel.
+
+    Call as conda_sidecar_imports(globals()). Finds each loaded kernel.py through its
+    functions' __code__.co_filename (no filesystem search) and returns
+    {skill: {'path', 'top_level', 'in_functions'}}. 'top_level' imports must exist in an
+    env for the sidecar to load there; 'in_functions' only when those helpers are called.
+    Module names are import names (yaml = pyyaml, PIL = pillow, sklearn = scikit-learn).
+    """
+    std = set(getattr(sys, "stdlib_module_names", ()))
+    files = set()
+    for v in list(namespace.values()):
+        code = getattr(v, "__code__", None)
+        if code is not None and os.path.basename(code.co_filename) == "kernel.py" and os.path.isfile(code.co_filename):
+            files.add(code.co_filename)
+    out = {}
+    for f in sorted(files):
+        tree = ast.parse(open(f).read())
+        top = {id(n) for n in tree.body}
+        found = {"top_level": set(), "in_functions": set()}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                mods = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                mods = [node.module]
+            else:
+                continue
+            for m in mods:
+                root = m.split(".")[0]
+                if root not in std:
+                    found["top_level" if id(node) in top else "in_functions"].add(root)
+        found["in_functions"] -= found["top_level"]
+        out[os.path.basename(os.path.dirname(f))] = {"path": f, "top_level": sorted(found["top_level"]),
+                                                      "in_functions": sorted(found["in_functions"])}
     return out
