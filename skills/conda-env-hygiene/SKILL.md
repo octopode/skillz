@@ -1,6 +1,6 @@
 ---
 name: conda-env-hygiene
-description: "Keep Claude Science conda environments clean and reproducible: one named environment per project or tool stack, created in one go with a pinned Python, conda-forge/bioconda before pip, and an environment.yml written into the project folder. Use this skill BEFORE any package install or environment choice - whenever a task needs a package the starter python/r envs lack, an ImportError or ModuleNotFoundError appears, manage_environments or manage_packages is about to be called, someone wants pip install, or an environment.yml must be exported, rebuilt or audited. Ships stdlib-only helpers (kernel.py) that find which envs already hold a package, check conda-forge/bioconda for a build, export a from-history environment.yml including pip requests, and audit envs for drift."
+description: "Keep Claude Science conda environments lean and conflict-free: run in any env that already has everything, but never add packages to the shared starter python/r envs or to another project's env; missing packages go into one named env per project or tool stack, created in one go with a pinned Python, conda-forge/bioconda before pip, with an environment.yml written into the project folder. Use this skill BEFORE any package install or environment choice - whenever a task needs a package the starter python/r envs lack, an ImportError or ModuleNotFoundError appears, manage_environments or manage_packages is about to be called, someone wants pip install, or an environment.yml must be exported, rebuilt or audited. Ships stdlib-only helpers (kernel.py) that find which envs already hold a package, check conda-forge/bioconda for a build, export a from-history environment.yml including pip requests, and audit envs for drift."
 ---
 
 # conda-env-hygiene
@@ -10,8 +10,13 @@ environment, install everything at once, use conda before pip and pip only last,
 rebuild rather than run conda after pip, and keep the requirements in a file
 ([conda docs: managing environments](https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html),
 [Anaconda: using pip in a conda environment](https://www.anaconda.com/blog/using-pip-in-a-conda-environment)).
-This skill overrides the generic "reuse the env that already has most of the
-packages" habit: package coverage never decides which env to use, purpose does.
+Two purposes: (1) keep the shared starter envs (`python`, `r`) lean, because every
+package added to them slows every session that loads them; (2) avoid version
+conflicts between projects. Reading from any env is harmless; adding to the wrong env
+is the problem. This skill overrides the generic "reuse the env with most of the
+packages and add the rest" habit: running in any env that already has everything is
+fine, but missing packages go only into an env this project owns, otherwise into a
+new one.
 
 ## How environments work here (read once)
 
@@ -58,25 +63,27 @@ is denylisted in the sandbox.
    skills' `kernel.py` files import (see pitfalls) and `pip` if any PyPI-only package
    is expected. Decide the project: the granted folder or repo being worked on, or,
    if there is none, the tool stack (e.g. `geospatial`, `browser`).
-2. **Starter envs (`python`, `r`)**: use them only when everything needed is
-   already there. Never install into, rebuild or delete them, even when the audit
-   flags drift: they are the app's, shared by every project, and past work relies on
-   what they hold. Packages that drifted into them stay; a project that needs one
-   gets it in its own env.
-3. **Look for the env that belongs to this project or stack.** Run
-   `manage_environments(mode="list")` and `conda_find([...])`. Reuse an env only if
-   its name/purpose matches the project or stack. An env built for another project
-   that happens to contain the packages is not a candidate (e.g. a snakemake env
-   that picked up xarray is not the place for unrelated xarray work). If memory or
-   the project folder names an env (or the folder holds an `environment.yml`), that
-   is the one.
-4. **Conda first.** `conda_channel_lookup([...])` for anything not obviously on
+2. **Starter envs (`python`, `r`)**: never install into, rebuild or delete them,
+   even when the audit flags drift: they are the app's, shared by every project, and
+   past work relies on what they hold. Running in them is fine when they already have
+   everything.
+3. **Does some env already have everything?** Run `conda_find([...])` (or
+   `manage_environments(mode="list", dependencies=[...])`). If one env has usable
+   versions of all the packages, run the work there as it is, with no installs and no
+   export; say which env was used. Any env qualifies, including another project's.
+4. **Something is missing.** Install only into an env this project or stack owns:
+   one named after it, or named by memory or by an `environment.yml` in the project
+   folder. Never add packages to a starter env or to an env that belongs to another
+   project, even if it lacks only one package: that is how cross-project version
+   conflicts start. If this project owns no env, create one (step 6) with the full
+   list, including what another env already had.
+5. **Conda first.** `conda_channel_lookup([...])` for anything not obviously on
    conda-forge. PyPI and conda names usually match after normalisation, but not
    always (`torch` = `pytorch`, `tables` = `pytables`, `opencv-python` = `opencv`);
    check the conda-forge name before falling back to pip. Bio tools: add `bioconda`
    after `conda-forge`. Exception in `PIP_PREFERRED`: `playwright` (conda-forge has
    only the CLI).
-5. **Create once, with everything**:
+6. **Create once, with everything**:
    ```
    manage_environments(mode="create", name="<project-or-stack>",
        python_version="3.12", channels=["conda-forge"],   # + "bioconda" if needed
@@ -87,16 +94,16 @@ is denylisted in the sandbox.
    `conda_env_names()` that the name is free. For R:
    `language="r"`, packages as `r-<name>` from conda-forge, Bioconductor as
    `bioconductor-<name>` from bioconda.
-6. **PyPI-only packages: immediately after creation**, all in one call:
+7. **PyPI-only packages: immediately after creation**, all in one call:
    `manage_packages(mode="install", environment=..., packages=[...], use_pip=True)`.
-7. **Export**: `conda_env_yml("<env>", "<project folder>")` writes
+8. **Export** (envs this project owns): `conda_env_yml("<env>", "<project folder>")` writes
    `<project folder>/environment.yml`. With no writable project folder, write it to
    the workspace and `save_artifacts` it. Re-export after every change. Default
    `versions="comment"` records the installed versions as comments; `versions="pin"`
    pins them for an exact same-platform rebuild.
-8. Run the work with `environment="<env>"`.
+9. Run the work with `environment="<env>"`.
 
-## Adding to an existing env later
+## Adding to an env this project owns
 
 - Env has **no pip requests** (`conda_env_spec(env)["pip"] == []`): one
   `manage_packages` install with all the new conda packages is acceptable. Re-export.
