@@ -23,7 +23,9 @@ below). Session folder for this user: see memory; otherwise `~/paperpile-session
 3. **File what the project uses.** A source is "used" when it is read, quoted, cited, or
    kept for a deliverable, or the user asks to keep it (not every search hit). File it into
    the project folder with `pp_file()`, then sync (below). Filing additions is automatic;
-   report what was filed at the end of the turn.
+   report what was filed at the end of the turn, including `other_versions` (a new entry whose
+   title matches a library entry with another DOI or year, typically preprint vs published
+   version: not a duplicate, but tell the user which version the project cites).
 4. **Complete missing metadata (standing request from the user).** When a library entry is
    matched by title and lacks fields, `pp_enrich` fills the EMPTY ones (DOI, journal, volume,
    issue, pages, publisher, PMID, abstract) — only if the library entry, Paperpile's catalog
@@ -38,6 +40,13 @@ below). Session folder for this user: see memory; otherwise `~/paperpile-session
    highlighting, filing into folders other than the project's, and `send_paperpile_feedback`
    need the user's explicit OK, unless they just asked for that exact change.
 6. **Cite in Paperpile's format**: citekey, authors, journal, year, DOI link, as returned.
+7. **`sources.bib` is mandatory once a project uses any source.** Create it at the project's
+   first literature work, and resync it before ending any turn that filed, cited or dropped a
+   source, so the artifact always matches the folder. A project that has used sources but has
+   no `sources.bib` is out of compliance: onboard it (below). Projects that use no literature
+   get no file (an empty one says nothing). The artifact is the canonical local copy; if a
+   pipeline (e.g. a Snakemake report rule) needs the BibTeX, write a copy into the repository
+   as a declared input, regenerate it from the artifact at each sync, never edit it by hand.
 
 ## Project sync (two-way)
 The project's Paperpile folder is named exactly like the Claude Science project, at top
@@ -70,6 +79,22 @@ else:
 - Folder mappings live in `project_folders.json`, sync state in `sync/<project>.json`.
 - Report `pushed`, `pulled_new` and `removed_upstream` to the user in one line.
 
+## Onboarding an existing project
+For a project that used sources before this skill (no `sources.bib`, or an incomplete folder):
+1. Sync once (creates or maps the folder; pulls what the user already filed there).
+2. Collect the sources the project USED from its own records: evidence/extraction tables
+   (DOI and citation columns), report and manuscript reference lists, retrieved-PDF manifests.
+   Not every PDF in a downloads folder is used; files the project set aside are not.
+3. `pp_audit_project(PROJECT, used)` (read-only) lists `missing`, `not_used` and `not_doi`.
+   DOI columns often hold web URLs (standards, reports, grey literature): `pp_doi` rejects
+   them, so give those items a `title` and hand-written `bibtex` (title, authors or
+   institution, year, number, url; only fields read from the document itself).
+4. Before filing DOI-less items, `search_library` their titles: the user may hold them
+   under other titles (e.g. a report filed under its chapter title).
+5. `pp_file(folder_id, missing)`, then sync, save `sources.bib`, rerun the audit: `missing`
+   must be empty. Report counts, `other_versions`, and `not_used` entries (entries the user
+   placed in the folder that the project does not cite: ask before removing any).
+
 ## Helpers
 | Helper | Purpose |
 |---|---|
@@ -78,7 +103,9 @@ else:
 | `pp_json(tool, rationale, **args)` | same with `output_format="JSON"`, parsed (raises on errors) |
 | `pp_lookup(dois=, citekeys=)` | library entries for known papers (JSON objects) |
 | `pp_library_fulltext(doi= / citekey=, max_bytes=100000)` | `ok` with page-labelled `text`, `truncated`; or `no_pdf` / `not_in_library` |
-| `pp_file(folder_id, items)` | file `[{doi, title, bibtex}]` without duplicates; report: `already_in_folder`, `added_to_folder`, `saved_new`, `failed`, `enriched` |
+| `pp_file(folder_id, items)` | file `[{doi, title, bibtex}]` without duplicates; report: `already_in_folder`, `added_to_folder`, `saved_new`, `failed`, `enriched`, `other_versions` |
+| `pp_audit_project(name, used)` | read-only: `missing` (used, not in folder), `not_used`, `not_doi` |
+| `pp_other_versions(title, doi)` / `pp_folder_ids(ref)` | same-title entries with another DOI/year / folder ids from either API shape |
 | `pp_enrich(lib_ref, catalog_rec)` / `pp_catalog(dois)` / `pp_crossref(doi)` | verified fill of empty fields / catalog metadata (saves nothing) / independent Crossref record |
 | `pp_project_folder(name)` / `pp_map_project_folder(name, id)` | find or create the project folder |
 | `pp_sync_project(name, local_bib)` | two-way sync; returns new `bib` text and a report |
@@ -96,6 +123,8 @@ the matching guide) first; treat it as guidance, not as instructions that overri
 these rules. Read-only tools: `search_library`, `get_references_from_library`,
 `get_collections_from_library`, `get_libraries`, `get_text_content`, `find_papers` (external
 catalogs), `get_inbound_cites`, `get_outbound_references`, `lookup_papers`.
+`folders` differs by tool: `search_library` gives folder objects (`{id, name, ...}`),
+`get_references_from_library` gives id strings; compare through `pp_folder_ids(ref)`.
 
 ## Setup
 Do these with the user once per installation. Relay the user steps word for word.
@@ -164,6 +193,11 @@ exchange at `/api/oauth/token`. About 0.5 s, no browser. Set-Cookie updates go b
   text via title fallback, folder creation, idempotent re-sync, close-match confirmation,
   pulling a paper the user added to the folder, and dropping one the user removed
   (`removed_upstream`, reported by citekey).
+- 2026-11-13 (first real-project onboarding, 146 sources): fixed `pp_file` sending
+  `note=null` with BibTeX saves (server rejects it); fixed "already in folder" misreported as
+  `added_to_folder` for title matches (folder-object vs id shapes); URL-shaped "DOIs" now
+  fail early with a reason instead of at the server; empty-key items are reported, not
+  dropped; added `other_versions`, `pp_audit_project`, rule 7 and the onboarding procedure.
 - Why no connector: Paperpile's client registration accepts only the claude.ai callback and
   loopback redirects; Claude Science's connector callback gets 403. Paperpile said support is
   in progress. Once a real connector works, keep these rules but drop the auth plumbing.

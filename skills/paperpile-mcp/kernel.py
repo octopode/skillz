@@ -472,9 +472,15 @@ def pp_norm(s):
 
 
 def pp_doi(s):
+    """Normalised DOI, or None when `s` is not a DOI (e.g. a web URL stored in a doi column)."""
     s = (s or "").strip().lower()
-    s = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:)", "", s)
-    return s or None
+    s = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:\s*)", "", s)
+    return s if re.match(r"^10\.\d{4,9}/\S+$", s) else None
+
+
+def pp_folder_ids(ref):
+    """Folder ids of a reference. search_library gives folder objects, get_references ids."""
+    return [f.get("id") if isinstance(f, dict) else f for f in (ref.get("folders") or [])]
 
 
 def pp_ref_key(ref):
@@ -599,6 +605,24 @@ def pp_find_title(title, session_dir=None, year=None):
     return None
 
 
+def pp_other_versions(title, doi=None, session_dir=None):
+    """Library entries with the same normalised title but another DOI or year, e.g. the preprint
+    and the published version of one work. Read-only; used to flag, never to skip filing."""
+    want = pp_norm(title)
+    if not want:
+        return []
+    res = pp_json("search_library", "Check for other versions (preprint/published) of a paper being filed",
+                  session_dir, q=title[:200], limit=10)
+    out = []
+    for hit in res.get("data", []):
+        ref = hit.get("reference") or {}
+        if pp_norm(ref.get("title")) == want and pp_doi(ref.get("doi")) != pp_doi(doi):
+            out.append({"citekey": ref.get("citekey"), "doi": ref.get("doi"),
+                        "year": (ref.get("published") or "")[:4], "journal": ref.get("journal"),
+                        "folders": pp_folder_ids(ref)})
+    return out
+
+
 def pp_library_fulltext(doi=None, citekey=None, max_bytes=100000, session_dir=None):
     """Library-first full text. Returns status ok (text from the user's stored PDF), no_pdf or
     not_in_library. Only when it is not 'ok' may the web be searched for the full text."""
@@ -708,13 +732,21 @@ def pp_file(folder_id, items, session_dir=None, note=None):
     """File sources into a folder without ever creating duplicates.
     items: list of dicts with 'doi' and/or 'title' and optional 'bibtex' (one entry) for DOI-less
     works. Existing library entries are only added to the folder; new ones are saved into it.
-    Returns lists of citekeys/identifiers: already_in_folder, added_to_folder, saved_new, failed."""
+    Returns lists of citekeys/identifiers: already_in_folder, added_to_folder, saved_new, failed,
+    enriched, and other_versions (new saves whose title matches a library entry with another DOI or
+    year, e.g. preprint vs published version: report them; they are not duplicates)."""
     d = pp_session_dir(session_dir)
-    rep = {"already_in_folder": [], "added_to_folder": [], "saved_new": [], "failed": [], "enriched": []}
+    rep = {"already_in_folder": [], "added_to_folder": [], "saved_new": [], "failed": [], "enriched": [],
+           "other_versions": []}
     seen, uniq = set(), []
     for it in items:
         k = pp_ref_key(it)
-        if k not in seen and k not in ("title:",):
+        if k == "title:":                # no DOI and no title: keep it so it is reported, not dropped
+            k = "raw:" + str(it.get("doi") or it.get("bibtex") or "")
+            if k == "raw:":
+                rep["failed"].append({"item": None, "why": "empty item (no DOI, title or BibTeX)"})
+                continue
+        if k not in seen:
             seen.add(k)
             uniq.append(it)
     dois = [pp_doi(it.get("doi")) for it in uniq if pp_doi(it.get("doi"))]
@@ -724,6 +756,10 @@ def pp_file(folder_id, items, session_dir=None, note=None):
     to_add, new_dois = [], []
     for it in uniq:
         doi = pp_doi(it.get("doi"))
+        if it.get("doi") and not doi and not it.get("bibtex"):
+            rep["failed"].append({"item": it.get("title") or it.get("doi"),
+                                  "why": "not a DOI (" + str(it["doi"])[:60] + "); file it with title + bibtex"})
+            continue
         ref = existing.get(doi) if doi else pp_find_title(it.get("title"), d)
         if doi and not ref:          # entry may be stored without a DOI: match by title (+year, author)
             cat = cats.get(doi) or ({"title": it["title"], "doi": doi} if it.get("title") else None)
@@ -737,13 +773,18 @@ def pp_file(folder_id, items, session_dir=None, note=None):
                         rep["enriched"].append({"citekey": ref.get("citekey"), **en})
                 else:
                     ref = None
+            if not ref and cat:          # flag (not skip) preprint/published pairs and similar
+                ov = pp_other_versions(cat.get("title"), doi, d)
+                if ov:
+                    rep["other_versions"].append({"doi": doi, "title": cat.get("title"), "existing": ov})
         if ref:
-            (rep["already_in_folder"] if folder_id in (ref.get("folders") or []) else to_add).append(ref)
+            (rep["already_in_folder"] if folder_id in pp_folder_ids(ref) else to_add).append(ref)
         elif doi:
             new_dois.append(doi)
         elif it.get("bibtex"):
             res = pp_json("save_to_library", "File a source used in this project (no duplicate found)", d,
-                          bibtex=it["bibtex"], folder_ids=[folder_id], skip_duplicates=True, note=note)
+                          bibtex=it["bibtex"], folder_ids=[folder_id], skip_duplicates=True,
+                          **({"note": note} if note else {}))
             rep["saved_new"].append(it.get("title") or "bibtex entry")
         else:
             rep["failed"].append({"item": it.get("title"), "why": "no DOI and no BibTeX"})
@@ -835,7 +876,8 @@ def pp_sync_project(project, local_bib="", session_dir=None):
     removed_upstream = sorted(k for k in synced if k not in before_keys)
     push = [e for e in local if not (pp_ref_keys(e) & before_keys) and not (pp_ref_keys(e) & synced)]
     rep = pp_file(fid, [{"doi": e["doi"], "title": e["title"], "bibtex": e["raw"]} for e in push], d) if push else \
-        {"already_in_folder": [], "added_to_folder": [], "saved_new": [], "failed": [], "enriched": []}
+        {"already_in_folder": [], "added_to_folder": [], "saved_new": [], "failed": [], "enriched": [],
+         "other_versions": []}
     after = pp_folder_refs(fid, d)
     keys_after = set().union(*[pp_ref_keys(r) for r in after] or [set()])
     local_keys = set().union(*[pp_ref_keys(e) for e in local] or [set()])
@@ -851,3 +893,31 @@ def pp_sync_project(project, local_bib="", session_dir=None):
     return {"status": "ok", "folder": pf["name"], "folder_id": fid, "folder_status": pf["status"],
             "pushed": rep, "pulled_new": sorted(r.get("citekey") for r in after if not (pp_ref_keys(r) & local_keys)),
             "removed_upstream": sorted({names.get(k, k) for k in removed_upstream}), "count": len(after), "bib": bib}
+
+
+def pp_audit_project(project, used, session_dir=None):
+    """Read-only compliance check: which sources the project uses are missing from its folder.
+    used: [{'doi'?, 'title'?}] gathered from the project's files (evidence tables, reports, notes).
+    Returns folder_id, missing (used, not in the folder), not_used (in the folder, not in `used`;
+    report them, never remove without the user's OK), not_doi (doi values that are not DOIs:
+    file them with title + bibtex), count. status 'confirm'/'missing' as pp_project_folder."""
+    d = pp_session_dir(session_dir)
+    pf = pp_project_folder(project, create=False, session_dir=d)
+    if pf["status"] != "ok":
+        return pf
+    refs = pp_folder_refs(pf["folder_id"], d)
+    have = set().union(*[pp_ref_keys(r) for r in refs] or [set()])
+    used_keys, missing, not_doi = set(), [], []
+    for u in used:
+        if u.get("doi") and not pp_doi(u["doi"]):
+            not_doi.append(u)
+            if not pp_norm(u.get("title")):
+                continue                 # cannot be matched without a title: listed in not_doi only
+        ks = pp_ref_keys(u)
+        used_keys |= ks
+        if not (ks & have):
+            missing.append(u)
+    not_used = [{"citekey": r.get("citekey"), "doi": r.get("doi"), "title": r.get("title")}
+                for r in refs if not (pp_ref_keys(r) & used_keys)]
+    return {"status": "ok", "folder_id": pf["folder_id"], "count": len(refs), "missing": missing,
+            "not_used": not_used, "not_doi": not_doi}
