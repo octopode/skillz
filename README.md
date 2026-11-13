@@ -10,6 +10,7 @@ under [`skills/`](skills/): a `SKILL.md` with YAML frontmatter (`name`,
 | [`cannon-allocation-efficiency`](skills/cannon-allocation-efficiency/) | Checking that cluster jobs can actually saturate the CPU cores and memory they reserve, both before submitting and after running: `{threads}` pass-through, worker pools, nested-parallelism oversubscription, batch granularity, reserved-vs-used audits from `sacct` and Snakemake benchmark records, and SLURM job arrays (limits, `%N` throttles, per-task accounting, and why Snakemake's `--slurm-array-jobs` is unsafe in executor plugin 2.8.0; `array_probe/` holds the test workflow). `guard/` ships an `sbatch` shim that checks every submission. Written against Harvard FASRC's Cannon cluster, but applies to any SLURM site. |
 | [`openathens-fetch`](skills/openathens-fetch/) | Downloading paywalled journal PDFs through your own library OpenAthens login (Claude Science on macOS). A Chrome login window, run outside the sandbox, captures only the identity cookies (OpenAthens plus your institution's login site); the agent replays them through the publisher SAML chain, re-authenticates silently while your institution session lives, and opens the login window again (optionally by itself, via a LaunchAgent) when it does not. Defaults to Harvard Library; any OpenAthens institution works. Setup is in the skill's `README.md`. |
 | [`conda-env-hygiene`](skills/conda-env-hygiene/) | Keeping Claude Science conda environments lean and conflict-free: work runs in any env that already has everything, but packages are never added to the shared starter `python`/`r` envs or to another project's env. Missing packages go into one named env per project or tool stack, created in one go with a pinned Python; conda-forge/bioconda before pip, and pip only right after creation; an `environment.yml` written into the project folder. Stdlib-only helpers in `kernel.py` find which envs already hold a package, check conda-forge/bioconda for a build on your platform, export a `--from-history`-style `environment.yml` that also keeps explicit pip installs, and audit envs for drift. Claude Science-only. |
+| [`paperpile-mcp`](skills/paperpile-mcp/) | Making your Paperpile library the home of every source (Claude Science). The agent searches your library and reads full texts stored there before going to the web, never saves duplicate entries, and files each source a project uses into a Paperpile folder named after the Claude Science project, kept in two-way sync with the project's `sources.bib`. Talks to Paperpile's MCP server from the python kernel with your own login: Paperpile issues one-hour tokens and no refresh tokens, so the skill renews them silently from your Paperpile session cookie. Needs Paperpile's MCP/API beta; setup is in the skill's `README.md`. Claude Science-only. |
 
 `snakemake-workflow` hands cluster-sizing questions off to
 `cannon-allocation-efficiency`, so install both together.
@@ -22,7 +23,7 @@ default branch, and Claude Science records the commit they came from. Imported
 skills do not update on their own: use **Check for updates…** on the repo's entry
 under Settings > Skills > Imported to pull newer commits.
 
-**Claude Code** (`openathens-fetch` and `conda-env-hygiene` are Claude Science-only and are not in the plugin):
+**Claude Code** (`openathens-fetch`, `conda-env-hygiene` and `paperpile-mcp` are Claude Science-only and are not in the plugin):
 
 ```
 /plugin marketplace add octopode/skillz
@@ -44,6 +45,10 @@ Put the folder ahead of the real `sbatch` on `PATH`, as the skill describes.
 
 `openathens-fetch` copies its `launcher/` into a session folder with `oa_install()`,
 which sets the executable bits itself; see `skills/openathens-fetch/README.md`.
+
+`paperpile-mcp` needs a one-time setup: a private session folder and your Paperpile session
+cookie stored as a Claude Science credential named `PAPERPILE_SESSION`; see
+`skills/paperpile-mcp/README.md`.
 
 ## Cluster notes
 
