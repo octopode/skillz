@@ -13,20 +13,31 @@ below). Session folder for this user: see memory; otherwise `~/paperpile-session
 1. **Library first.** Before any web search or full-text fetch, look in the library:
    `pp_call("search_library", ...)` for topics, `pp_lookup(dois=[...])` for known papers,
    `pp_library_fulltext(doi=...)` for text. Use `fetch_article_fulltext`, openathens-fetch or
-   the web only when that returns `not_in_library` or `no_pdf`.
+   the web only when that returns `not_in_library` or `no_pdf`. Many library entries have no
+   DOI: both helpers fall back to the catalog title and match by title + year + first author.
 2. **Never duplicate.** Never call `save_to_library` directly. File only through `pp_file()`
-   or `pp_sync_project()`, which match by DOI (and by exact title for DOI-less works), add
-   existing entries to folders instead of saving them again, and pass `skip_duplicates`.
+   or `pp_sync_project()`, which match by DOI, then by the catalog title (+ year, first author)
+   for entries stored without a DOI, add existing entries to folders instead of saving them
+   again, and pass `skip_duplicates`.
    The same holds locally: one entry per DOI in `sources.bib`, one artifact per PDF.
 3. **File what the project uses.** A source is "used" when it is read, quoted, cited, or
    kept for a deliverable, or the user asks to keep it (not every search hit). File it into
    the project folder with `pp_file()`, then sync (below). Filing additions is automatic;
    report what was filed at the end of the turn.
-4. **Ask before anything else that writes.** Removing references from folders, trashing,
+4. **Complete missing metadata (standing request from the user).** When a library entry is
+   matched by title and lacks fields, `pp_enrich` fills the EMPTY ones (DOI, journal, volume,
+   issue, pages, publisher, PMID, abstract) — only if the library entry, Paperpile's catalog
+   and Crossref (independent) agree on title, year and first author, and it reads the entry
+   back to verify. It never overwrites a value and never touches title or authors.
+   `pp_file` and `pp_library_fulltext` do this automatically; report `enriched`. Paperpile's
+   built-in metadata auto-update is not fully reliable (the user's experience), and
+   `lookup_papers` likely shares its source, so never write on the catalog alone. Correcting
+   an existing (non-empty) value is an edit: ask first, showing old and new.
+5. **Ask before anything else that writes.** Removing references from folders, trashing,
    deleting folders or labels, editing notes (a `note` replaces the user's whole note),
    highlighting, filing into folders other than the project's, and `send_paperpile_feedback`
    need the user's explicit OK, unless they just asked for that exact change.
-5. **Cite in Paperpile's format**: citekey, authors, journal, year, DOI link, as returned.
+6. **Cite in Paperpile's format**: citekey, authors, journal, year, DOI link, as returned.
 
 ## Project sync (two-way)
 The project's Paperpile folder is named exactly like the Claude Science project, at top
@@ -67,7 +78,8 @@ else:
 | `pp_json(tool, rationale, **args)` | same with `output_format="JSON"`, parsed (raises on errors) |
 | `pp_lookup(dois=, citekeys=)` | library entries for known papers (JSON objects) |
 | `pp_library_fulltext(doi= / citekey=, max_bytes=100000)` | `ok` with page-labelled `text`, `truncated`; or `no_pdf` / `not_in_library` |
-| `pp_file(folder_id, items)` | file `[{doi, title, bibtex}]` without duplicates; report of what happened |
+| `pp_file(folder_id, items)` | file `[{doi, title, bibtex}]` without duplicates; report: `already_in_folder`, `added_to_folder`, `saved_new`, `failed`, `enriched` |
+| `pp_enrich(lib_ref, catalog_rec)` / `pp_catalog(dois)` / `pp_crossref(doi)` | verified fill of empty fields / catalog metadata (saves nothing) / independent Crossref record |
 | `pp_project_folder(name)` / `pp_map_project_folder(name, id)` | find or create the project folder |
 | `pp_sync_project(name, local_bib)` | two-way sync; returns new `bib` text and a report |
 | `pp_folder_refs(folder_id)` / `pp_bibtex(refs)` | list a folder / render BibTeX |
@@ -107,7 +119,8 @@ Do these with the user once per installation. Relay the user steps word for word
 **Agent steps**
 1. `request_host_access` for the session folder (rw); set `os.environ["PP_SESSION_DIR"]`.
 2. Allow network hosts when helpers return `needs_allowlist`: `api.paperpile.com`,
-   `mcp.paperpile.com`, and `api.github.com` for `pp_workflow`.
+   `mcp.paperpile.com`, `api.crossref.org` (metadata verification), and `api.github.com`
+   for `pp_workflow`.
 3. In a python cell declaring `credentials=["PAPERPILE_SESSION"]`: `pp_set_cookie()`; it must
    list `plack_session` in `cookie_names`. No later cell needs the credential.
 4. `pp_session_status()` must return `valid` (this registers the OAuth client on first use).
@@ -143,10 +156,14 @@ exchange at `/api/oauth/token`. About 0.5 s, no browser. Set-Cookie updates go b
 - Verified 2026-11-13 against paperpile-platform MCP 0.1.0 (protocol 2025-06-18, stateless),
   14 tools, no tool annotations (write tools are hard-coded in `PP_WRITE_TOOLS`).
   `save_to_library` reports per-DOI `status` (`duplicate` + `existing` when already present).
-  `get_text_content` returns JSON pages (`content[].text`, `total_pages`). Tested: renewal,
-  duplicate refusal, title match, library full text, folder creation, idempotent re-sync,
-  close-match confirmation. Not yet exercised: saving a brand-new DOI, pulling a paper the
-  user added in Paperpile, `removed_upstream`.
+  `get_text_content` returns JSON pages (`content[].text`, `total_pages`). `lookup_papers`
+  JSON is `{papers: [...], not_found: [...]}`. `update_references` `metadata` works on one
+  reference per call, cannot be combined with folder changes, and replaces each field sent.
+  Tested 2026-11-13: renewal, duplicate refusal, saving a new DOI (and re-filing it),
+  DOI-less entry matched by title and enriched (Crossref-verified, read back), library full
+  text via title fallback, folder creation, idempotent re-sync, close-match confirmation,
+  pulling a paper the user added to the folder, and dropping one the user removed
+  (`removed_upstream`, reported by citekey).
 - Why no connector: Paperpile's client registration accepts only the claude.ai callback and
   loopback redirects; Claude Science's connector callback gets 403. Paperpile said support is
   in progress. Once a real connector works, keep these rules but drop the auth plumbing.

@@ -26,6 +26,9 @@ How the agent treats literature:
   before looking anywhere on the web.
 - **No duplicates.** Papers already in your library are never saved again; they are only
   added to folders.
+- **Fills gaps, carefully.** If one of your entries lacks a DOI or other details, the agent
+  fills in only the empty fields, and only when your entry, Paperpile's catalog and Crossref
+  agree it is the same paper. It never overwrites what you entered, and tells you what it filled.
 - **One folder per project.** Each Claude Science project gets a top-level Paperpile folder
   with exactly the project's name (if a similar folder exists, e.g. `EnergyBudget` for
   `energy-budget`, it asks once which to use). Sources the project uses are filed there

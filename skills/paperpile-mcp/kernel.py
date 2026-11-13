@@ -478,9 +478,94 @@ def pp_doi(s):
 
 
 def pp_ref_key(ref):
-    """Identity of a reference for de-duplication: DOI, else normalised title."""
+    """Primary identity of a reference: DOI, else normalised title."""
     d = pp_doi(ref.get("doi"))
     return ("doi:" + d) if d else ("title:" + pp_norm(ref.get("title")))
+
+
+def pp_ref_keys(ref):
+    """All identities (DOI and title) so entries with and without a DOI still match."""
+    ks = set()
+    if pp_doi(ref.get("doi")):
+        ks.add("doi:" + pp_doi(ref.get("doi")))
+    if pp_norm(ref.get("title")):
+        ks.add("title:" + pp_norm(ref.get("title")))
+    return ks
+
+
+def pp_catalog(dois, session_dir=None):
+    """{doi: catalog record} from Paperpile's catalog (lookup_papers; saves nothing)."""
+    out = {}
+    for i in range(0, len(dois), 25):
+        res = pp_json("lookup_papers", "Get catalog metadata to match library entries stored without a DOI",
+                      session_dir, dois=dois[i:i + 25])
+        for x in res.get("papers", []):
+            if pp_doi(x.get("doi")):
+                out[pp_doi(x["doi"])] = x
+    return out
+
+
+def pp_first_family(ref):
+    a = (ref.get("author") or [{}])[0] or {}
+    return pp_norm(a.get("family") or a.get("literal") or "")
+
+
+def pp_same_work(lib, cat):
+    """Confident identity: same normalised title, and same year and first author when both known."""
+    if not pp_norm(lib.get("title")) or pp_norm(lib.get("title")) != pp_norm(cat.get("title")):
+        return False
+    ly, cy = (lib.get("published") or "")[:4], (cat.get("published") or "")[:4]
+    lf, cf = pp_first_family(lib), pp_first_family(cat)
+    return not (ly and cy and ly != cy) and not (lf and cf and lf != cf)
+
+
+def pp_crossref(doi):
+    """Independent check: Crossref's record for a DOI, in Paperpile-like field names (or None)."""
+    st, _, raw = pp_http("GET", "https://api.crossref.org/works/" + urllib.parse.quote(pp_doi(doi) or "", safe="/"),
+                         headers={"Accept": "application/json"}, timeout=30)
+    if st != 200:
+        return None
+    m = json.loads(raw).get("message", {})
+    dp = ((m.get("issued") or m.get("published") or {}).get("date-parts") or [[None]])[0]
+    return {"doi": pp_doi(m.get("DOI")), "title": (m.get("title") or [""])[0],
+            "published": str(dp[0]) if dp and dp[0] else "",
+            "author": [{"family": a.get("family") or a.get("name")} for a in (m.get("author") or [])],
+            "journal": (m.get("container-title") or [None])[0], "volume": m.get("volume"),
+            "issue": m.get("issue"), "pages": m.get("page"), "publisher": m.get("publisher")}
+
+
+def pp_enrich(ref, cat, session_dir=None):
+    """Fill EMPTY bibliographic fields of a library entry, only when the library entry, Paperpile's
+    catalog record and Crossref (independent) all agree on title, year and first author.
+    Never overwrites existing values, never touches title/authors; reads back to verify.
+    Returns {'filled': [...], 'skipped': reason or None}."""
+    doi = pp_doi(cat.get("doi"))
+    if not doi or not pp_same_work(ref, cat):
+        return {"filled": [], "skipped": "catalog record does not match the library entry"}
+    try:
+        cr = pp_crossref(doi)
+    except RuntimeError as e:
+        return {"filled": [], "skipped": "Crossref unreachable (" + str(e)[:60] + ")"}
+    if not cr or not pp_same_work(ref, cr) or not pp_same_work(cat, cr):
+        return {"filled": [], "skipped": "Crossref does not confirm the match"}
+    full = pp_lookup(citekeys=[ref["citekey"]], session_dir=session_dir) if ref.get("citekey") else []
+    ref = full[0] if full else ref
+    if not ref.get("id"):
+        return {"filled": [], "skipped": "library entry id unknown"}
+    src = {"doi": cr.get("doi"), "journal": cr.get("journal") or cat.get("journal"),
+           "volume": cr.get("volume") or cat.get("volume"), "issue": cr.get("issue") or cat.get("issue"),
+           "pages": cr.get("pages") or cat.get("pages"), "publisher": cr.get("publisher") or cat.get("publisher"),
+           "pmid": cat.get("pmid"), "abstract": cat.get("abstract")}
+    fill = {f: v for f, v in src.items() if v and not ref.get(f)}
+    if not fill:
+        return {"filled": [], "skipped": None}
+    pp_json("update_references", "Fill in missing bibliographic fields (user's standing request; "
+            "empty fields only, verified against Crossref)", session_dir,
+            updates=[{"id": ref["id"], "metadata": fill}])
+    after = pp_lookup(citekeys=[ref["citekey"]], session_dir=session_dir)
+    ok = [f for f in fill if after and after[0].get(f)]
+    return {"filled": sorted(ok), "skipped": None if len(ok) == len(fill) else
+            "not stored: " + ", ".join(sorted(set(fill) - set(ok)))}
 
 
 def pp_lookup(dois=None, citekeys=None, session_dir=None):
@@ -499,8 +584,8 @@ def pp_lookup(dois=None, citekeys=None, session_dir=None):
     return out
 
 
-def pp_find_title(title, session_dir=None):
-    """Library reference whose normalised title equals `title` (duplicate check for DOI-less items)."""
+def pp_find_title(title, session_dir=None, year=None):
+    """Library reference whose normalised title equals `title` (and year, if both are known)."""
     want = pp_norm(title)
     if not want:
         return None
@@ -508,7 +593,8 @@ def pp_find_title(title, session_dir=None):
                   session_dir, q=title[:200], limit=5)
     for hit in res.get("data", []):
         ref = hit.get("reference") or {}
-        if pp_norm(ref.get("title")) == want:
+        ry = (ref.get("published") or "")[:4]
+        if pp_norm(ref.get("title")) == want and not (year and ry and str(year)[:4] != ry):
             return ref
     return None
 
@@ -518,6 +604,17 @@ def pp_library_fulltext(doi=None, citekey=None, max_bytes=100000, session_dir=No
     not_in_library. Only when it is not 'ok' may the web be searched for the full text."""
     refs = pp_lookup(dois=[doi] if doi else None, citekeys=[citekey] if citekey else None,
                      session_dir=session_dir)
+    enriched = []
+    if not refs and doi:
+        cat = pp_catalog([pp_doi(doi)], session_dir).get(pp_doi(doi))
+        hit = pp_find_title(cat.get("title"), session_dir, year=(cat.get("published") or "")[:4]) if cat else None
+        if hit:
+            refs = pp_lookup(citekeys=[hit["citekey"]], session_dir=session_dir) or [hit]
+            if pp_same_work(refs[0], cat):
+                enriched = pp_enrich(refs[0], cat, session_dir)
+                refs = pp_lookup(citekeys=[refs[0]["citekey"]], session_dir=session_dir) or refs
+            else:
+                refs = []
     if not refs:
         return {"status": "not_in_library"}
     ref = refs[0]
@@ -535,7 +632,8 @@ def pp_library_fulltext(doi=None, citekey=None, max_bytes=100000, session_dir=No
         truncated = last < (j.get("total_pages") or 0) or any(
             p.get("end") is not None and p.get("page_bytes") and p["end"] < p["page_bytes"] for p in pages)
         return {"status": "ok", "citekey": ref["citekey"], "title": ref.get("title"), "text": text,
-                "total_pages": j.get("total_pages"), "truncated": truncated, "file_id": j.get("file_id")}
+                "total_pages": j.get("total_pages"), "truncated": truncated, "file_id": j.get("file_id"),
+                "enriched": enriched}
     except ValueError:
         return {"status": "ok", "citekey": ref["citekey"], "title": ref.get("title"), "text": r["text"],
                 "truncated": None}
@@ -612,7 +710,7 @@ def pp_file(folder_id, items, session_dir=None, note=None):
     works. Existing library entries are only added to the folder; new ones are saved into it.
     Returns lists of citekeys/identifiers: already_in_folder, added_to_folder, saved_new, failed."""
     d = pp_session_dir(session_dir)
-    rep = {"already_in_folder": [], "added_to_folder": [], "saved_new": [], "failed": []}
+    rep = {"already_in_folder": [], "added_to_folder": [], "saved_new": [], "failed": [], "enriched": []}
     seen, uniq = set(), []
     for it in items:
         k = pp_ref_key(it)
@@ -621,10 +719,24 @@ def pp_file(folder_id, items, session_dir=None, note=None):
             uniq.append(it)
     dois = [pp_doi(it.get("doi")) for it in uniq if pp_doi(it.get("doi"))]
     existing = {pp_doi(r.get("doi")): r for r in pp_lookup(dois=dois, session_dir=d) if r.get("doi")}
+    missing = [x for x in dois if x not in existing]
+    cats = pp_catalog(missing, d) if missing else {}
     to_add, new_dois = [], []
     for it in uniq:
         doi = pp_doi(it.get("doi"))
         ref = existing.get(doi) if doi else pp_find_title(it.get("title"), d)
+        if doi and not ref:          # entry may be stored without a DOI: match by title (+year, author)
+            cat = cats.get(doi) or ({"title": it["title"], "doi": doi} if it.get("title") else None)
+            hit = pp_find_title(cat.get("title"), d, year=(cat.get("published") or "")[:4]) if cat else None
+            if hit:
+                full = pp_lookup(citekeys=[hit["citekey"]], session_dir=d)
+                ref = full[0] if full else hit
+                if pp_same_work(ref, cat):
+                    en = pp_enrich(ref, cat, d)
+                    if en["filled"] or en["skipped"]:
+                        rep["enriched"].append({"citekey": ref.get("citekey"), **en})
+                else:
+                    ref = None
         if ref:
             (rep["already_in_folder"] if folder_id in (ref.get("folders") or []) else to_add).append(ref)
         elif doi:
@@ -635,7 +747,13 @@ def pp_file(folder_id, items, session_dir=None, note=None):
             rep["saved_new"].append(it.get("title") or "bibtex entry")
         else:
             rep["failed"].append({"item": it.get("title"), "why": "no DOI and no BibTeX"})
-    rep["already_in_folder"] = [r.get("citekey") for r in rep["already_in_folder"]]
+    seen_ids, dedup = set(), []
+    for r in to_add:
+        if r["id"] not in seen_ids:
+            seen_ids.add(r["id"])
+            dedup.append(r)
+    to_add = dedup
+    rep["already_in_folder"] = sorted({r.get("citekey") for r in rep["already_in_folder"]})
     for i in range(0, len(to_add), 50):
         batch = to_add[i:i + 50]
         pp_json("update_references", "Add sources used in this project to its folder", d,
@@ -711,22 +829,25 @@ def pp_sync_project(project, local_bib="", session_dir=None):
     state_name = os.path.join("sync", (pp_norm(project) or "project") + ".json")
     state = pp_read_json(d, state_name, {}) or {}
     synced = set(state.get("keys", []))
+    names = state.get("citekeys", {})
     local = pp_bib_parse(local_bib)
-    before = {pp_ref_key(r): r for r in pp_folder_refs(fid, d)}
-    removed_upstream = sorted(k for k in synced if k not in before)
-    push = [e for e in local if pp_ref_key(e) not in before and pp_ref_key(e) not in synced]
+    before_keys = set().union(*[pp_ref_keys(r) for r in pp_folder_refs(fid, d)] or [set()])
+    removed_upstream = sorted(k for k in synced if k not in before_keys)
+    push = [e for e in local if not (pp_ref_keys(e) & before_keys) and not (pp_ref_keys(e) & synced)]
     rep = pp_file(fid, [{"doi": e["doi"], "title": e["title"], "bibtex": e["raw"]} for e in push], d) if push else \
-        {"already_in_folder": [], "added_to_folder": [], "saved_new": [], "failed": []}
+        {"already_in_folder": [], "added_to_folder": [], "saved_new": [], "failed": [], "enriched": []}
     after = pp_folder_refs(fid, d)
-    keys_after = {pp_ref_key(r) for r in after}
-    local_keys = {pp_ref_key(e) for e in local}
+    keys_after = set().union(*[pp_ref_keys(r) for r in after] or [set()])
+    local_keys = set().union(*[pp_ref_keys(e) for e in local] or [set()])
+    gone = set(removed_upstream)
     keep_local = [e["raw"] for e in local
-                  if pp_ref_key(e) not in keys_after and pp_ref_key(e) not in removed_upstream]
+                  if not (pp_ref_keys(e) & keys_after) and not (pp_ref_keys(e) & gone)]
     bib = pp_bibtex(sorted(after, key=lambda r: (r.get("citekey") or "").lower()))
     if keep_local:
         bib += "\n% Not yet in Paperpile (filing failed):\n" + "\n\n".join(keep_local) + "\n"
     pp_write_json(d, state_name, {"project": project, "folder_id": fid, "keys": sorted(keys_after),
+                                  "citekeys": {k: r.get("citekey") for r in after for k in pp_ref_keys(r)},
                                   "synced_at": time.time()}, private=False)
     return {"status": "ok", "folder": pf["name"], "folder_id": fid, "folder_status": pf["status"],
-            "pushed": rep, "pulled_new": sorted(r.get("citekey") for r in after if pp_ref_key(r) not in local_keys),
-            "removed_upstream": removed_upstream, "count": len(after), "bib": bib}
+            "pushed": rep, "pulled_new": sorted(r.get("citekey") for r in after if not (pp_ref_keys(r) & local_keys)),
+            "removed_upstream": sorted({names.get(k, k) for k in removed_upstream}), "count": len(after), "bib": bib}
